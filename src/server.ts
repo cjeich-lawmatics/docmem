@@ -182,6 +182,69 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  'docmem_overview',
+  {
+    description: 'Get an overview of a specific documentation topic — lists all sections with token counts and access frequency. Use after list_topics to understand a topic before searching.',
+    inputSchema: {
+      project: z.string().describe('Project name (e.g., "boost-api")'),
+      topic: z.string().describe('Topic name from list_topics (e.g., "features/automations")'),
+    },
+  },
+  async ({ project, topic }) => {
+    const projResult = await pool.query(
+      'SELECT id FROM docmem.projects WHERE name = $1',
+      [project]
+    );
+    if (projResult.rows.length === 0) {
+      return { content: [{ type: 'text' as const, text: `Project "${project}" not found.` }] };
+    }
+    const projectId = projResult.rows[0].id;
+
+    const result = await pool.query(
+      `SELECT
+        c.id,
+        c.source_file,
+        c.section_path,
+        c.token_count,
+        c.last_modified,
+        COALESCE(a.access_count, 0) AS access_count
+      FROM docmem.chunks c
+      LEFT JOIN docmem.access_stats a ON a.chunk_id = c.id
+      WHERE c.project_id = $1 AND c.topic = $2
+      ORDER BY c.source_file, c.section_path`,
+      [projectId, topic]
+    );
+
+    if (result.rows.length === 0) {
+      return { content: [{ type: 'text' as const, text: `No chunks found for topic "${topic}".` }] };
+    }
+
+    const totalTokens = result.rows.reduce((sum, r) => sum + r.token_count, 0);
+
+    const output = {
+      topic,
+      total_chunks: result.rows.length,
+      total_tokens: totalTokens,
+      sections: result.rows.map(row => ({
+        chunk_id: row.id,
+        source_file: row.source_file,
+        section_path: row.section_path,
+        token_count: row.token_count,
+        access_count: parseInt(row.access_count),
+        last_modified: row.last_modified,
+      })),
+    };
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify(output, null, 2),
+      }],
+    };
+  }
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);

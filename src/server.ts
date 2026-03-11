@@ -1,0 +1,153 @@
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import { pool } from './db/pool.js';
+
+const server = new McpServer({
+  name: 'docmem',
+  version: '0.1.0',
+});
+
+server.registerTool(
+  'docmem_search',
+  {
+    description: 'Semantic search across indexed documentation. Returns summaries and metadata only — use docmem_load_chunk to get full content. Always start here to find relevant docs.',
+    inputSchema: {
+      project: z.string().describe('Project name (e.g., "boost-api")'),
+      query: z.string().describe('Natural language search query'),
+      max_results: z.number().optional().default(5).describe('Max results to return (default 5)'),
+      topic: z.string().optional().describe('Filter to a specific topic (e.g., "features/automations")'),
+    },
+  },
+  async ({ project, query, max_results, topic }) => {
+    // Get project ID
+    const projResult = await pool.query(
+      'SELECT id FROM docmem.projects WHERE name = $1',
+      [project]
+    );
+    if (projResult.rows.length === 0) {
+      return { content: [{ type: 'text' as const, text: `Project "${project}" not found. Run "docmem index" first.` }] };
+    }
+    const projectId = projResult.rows[0].id;
+
+    // Generate embedding for the query
+    const { default: OpenAI } = await import('openai');
+    const { config } = await import('./config.js');
+    const openai = new OpenAI({ apiKey: config.openaiApiKey });
+    const embResponse = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: query,
+    });
+    const queryEmbedding = embResponse.data[0].embedding;
+    const embeddingStr = `[${queryEmbedding.join(',')}]`;
+
+    // Search with pgvector cosine distance
+    let sql = `
+      SELECT
+        c.id,
+        c.source_file,
+        c.section_path,
+        c.summary,
+        c.topic,
+        c.token_count,
+        1 - (c.embedding <=> $1::vector) AS similarity
+      FROM docmem.chunks c
+      WHERE c.project_id = $2
+    `;
+    const params: unknown[] = [embeddingStr, projectId];
+    let paramIdx = 3;
+
+    if (topic) {
+      sql += ` AND c.topic = $${paramIdx}`;
+      params.push(topic);
+      paramIdx++;
+    }
+
+    sql += ` ORDER BY c.embedding <=> $1::vector LIMIT $${paramIdx}`;
+    params.push(max_results ?? 5);
+
+    const results = await pool.query(sql, params);
+
+    if (results.rows.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No results found.' }] };
+    }
+
+    const output = results.rows.map((row, i) => ({
+      rank: i + 1,
+      chunk_id: row.id,
+      source_file: row.source_file,
+      section_path: row.section_path,
+      topic: row.topic,
+      token_count: row.token_count,
+      similarity: Math.round(row.similarity * 1000) / 1000,
+      summary: row.summary || `[${row.section_path}] (${row.token_count} tokens)`,
+    }));
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify(output, null, 2),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  'docmem_load_chunk',
+  {
+    description: 'Load the full content of a specific documentation chunk. Use chunk_id from docmem_search results.',
+    inputSchema: {
+      chunk_id: z.string().describe('The chunk ID from search results'),
+    },
+  },
+  async ({ chunk_id }) => {
+    const result = await pool.query(
+      `SELECT c.content, c.source_file, c.section_path, c.topic, c.token_count
+       FROM docmem.chunks c
+       WHERE c.id = $1`,
+      [chunk_id]
+    );
+
+    if (result.rows.length === 0) {
+      return { content: [{ type: 'text' as const, text: `Chunk "${chunk_id}" not found.` }] };
+    }
+
+    const row = result.rows[0];
+
+    // Record access for heat tracking
+    await pool.query(
+      `INSERT INTO docmem.access_stats (chunk_id, access_count, last_accessed)
+       VALUES ($1, 1, NOW())
+       ON CONFLICT (chunk_id) DO UPDATE SET
+         access_count = docmem.access_stats.access_count + 1,
+         last_accessed = NOW()`,
+      [chunk_id]
+    );
+
+    const output = {
+      source_file: row.source_file,
+      section_path: row.section_path,
+      topic: row.topic,
+      token_count: row.token_count,
+      content: row.content,
+    };
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify(output, null, 2),
+      }],
+    };
+  }
+);
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('DocMem MCP server running on stdio');
+}
+
+main().catch((err) => {
+  console.error('Server failed to start:', err);
+  process.exit(1);
+});

@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS docmem.chunks (
   section_path  TEXT NOT NULL,
   content       TEXT NOT NULL,
   summary       TEXT NOT NULL,
-  embedding     vector(1536) NOT NULL,
+  embedding     vector(768) NOT NULL,
   token_count   INT NOT NULL,
   topic         TEXT NOT NULL,
   tags          TEXT[] DEFAULT '{}',

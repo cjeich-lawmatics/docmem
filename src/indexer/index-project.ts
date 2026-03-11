@@ -3,7 +3,7 @@ import { resolve, relative } from 'path';
 import { glob } from 'node:fs/promises';
 import { pool } from '../db/pool.js';
 import { chunkMarkdown, type Chunk } from './chunker.js';
-import { generateEmbeddings, estimateTokens } from './embedder.js';
+import { embedDocuments, estimateTokens } from './embedder.js';
 
 interface ProjectConfig {
   project: string;
@@ -109,7 +109,7 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
   if (toEmbed.length > 0) {
     // Generate embeddings
     console.log('Generating embeddings...');
-    const embeddings = await generateEmbeddings(toEmbed.map(c => c.content));
+    const embeddings = await embedDocuments(toEmbed.map(c => c.content));
 
     // Upsert chunks
     for (let i = 0; i < toEmbed.length; i++) {

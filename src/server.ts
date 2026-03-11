@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { pool } from './db/pool.js';
+import { embedQuery } from './indexer/embedder.js';
 
 const server = new McpServer({
   name: 'docmem',
@@ -31,14 +32,7 @@ server.registerTool(
     const projectId = projResult.rows[0].id;
 
     // Generate embedding for the query
-    const { default: OpenAI } = await import('openai');
-    const { config } = await import('./config.js');
-    const openai = new OpenAI({ apiKey: config.openaiApiKey });
-    const embResponse = await openai.embeddings.create({
-      model: 'text-embedding-3-small',
-      input: query,
-    });
-    const queryEmbedding = embResponse.data[0].embedding;
+    const queryEmbedding = await embedQuery(query);
     const embeddingStr = `[${queryEmbedding.join(',')}]`;
 
     // Search with pgvector cosine distance

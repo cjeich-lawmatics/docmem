@@ -1,30 +1,65 @@
-import OpenAI from 'openai';
-import { config } from '../config.js';
+import { AutoModel, AutoTokenizer } from '@huggingface/transformers';
 
-const openai = new OpenAI({ apiKey: config.openaiApiKey });
+const MODEL_ID = 'onnx-community/embeddinggemma-300m-ONNX';
 
-const EMBEDDING_MODEL = 'text-embedding-3-small';
-const MAX_BATCH_SIZE = 100;
+// Task-specific prefixes required by EmbeddingGemma
+export const PREFIXES = {
+  query: 'task: search result | query: ',
+  document: 'title: none | text: ',
+} as const;
+
+let model: Awaited<ReturnType<typeof AutoModel.from_pretrained>> | null = null;
+let tokenizer: Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>> | null = null;
+
+async function getModel() {
+  if (!model) {
+    console.error('Loading EmbeddingGemma model (first run downloads ~340MB)...');
+    model = await AutoModel.from_pretrained(MODEL_ID, { dtype: 'q8' as any });
+    console.error('Model loaded.');
+  }
+  return model;
+}
+
+async function getTokenizer() {
+  if (!tokenizer) {
+    tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID);
+  }
+  return tokenizer;
+}
 
 /**
  * Generate embeddings for an array of texts.
- * Batches requests to respect API limits.
- * Returns embeddings in the same order as input texts.
+ * Texts should already have the appropriate prefix prepended.
+ * Returns 768-dimensional embeddings in the same order as input texts.
  */
 export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
-  const allEmbeddings: number[][] = [];
+  if (texts.length === 0) return [];
 
-  for (let i = 0; i < texts.length; i += MAX_BATCH_SIZE) {
-    const batch = texts.slice(i, i + MAX_BATCH_SIZE);
-    const response = await openai.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: batch,
-    });
-    const sorted = response.data.sort((a, b) => a.index - b.index);
-    allEmbeddings.push(...sorted.map(d => d.embedding));
-  }
+  const tok = await getTokenizer();
+  const mod = await getModel();
 
-  return allEmbeddings;
+  const inputs = await (tok as any)(texts, { padding: true });
+  const { sentence_embedding } = await (mod as any)(inputs);
+
+  return sentence_embedding.tolist() as number[][];
+}
+
+/**
+ * Generate embedding for a single query text.
+ * Automatically prepends the query prefix.
+ */
+export async function embedQuery(query: string): Promise<number[]> {
+  const results = await generateEmbeddings([PREFIXES.query + query]);
+  return results[0];
+}
+
+/**
+ * Generate embeddings for document texts.
+ * Automatically prepends the document prefix.
+ */
+export async function embedDocuments(texts: string[]): Promise<number[][]> {
+  const prefixed = texts.map(t => PREFIXES.document + t);
+  return generateEmbeddings(prefixed);
 }
 
 /**

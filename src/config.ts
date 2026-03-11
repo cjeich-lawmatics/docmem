@@ -23,5 +23,4 @@ const env = loadEnv();
 
 export const config = {
   databaseUrl: env.DATABASE_URL ?? 'postgresql://docmem:docmem@localhost:5433/docmem',
-  openaiApiKey: env.OPENAI_API_KEY ?? '',
 };

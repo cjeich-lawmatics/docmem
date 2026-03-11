@@ -1,0 +1,31 @@
+{
+  "name": "docmem",
+  "version": "0.1.0",
+  "description": "Token-efficient documentation retrieval MCP server",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "docmem": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/server.js",
+    "cli": "node dist/cli.js",
+    "db:migrate": "node dist/db/migrate.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "openai": "^6.27.0",
+    "pg": "^8.20.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.4.0",
+    "@types/pg": "^8.18.0",
+    "typescript": "^5.9.3"
+  }
+}

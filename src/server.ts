@@ -135,6 +135,53 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  'docmem_list_topics',
+  {
+    description: 'List all available documentation topics for a project with chunk counts. Cheapest possible operation — use this first to discover what documentation exists.',
+    inputSchema: {
+      project: z.string().describe('Project name (e.g., "boost-api")'),
+    },
+  },
+  async ({ project }) => {
+    const projResult = await pool.query(
+      'SELECT id FROM docmem.projects WHERE name = $1',
+      [project]
+    );
+    if (projResult.rows.length === 0) {
+      return { content: [{ type: 'text' as const, text: `Project "${project}" not found.` }] };
+    }
+    const projectId = projResult.rows[0].id;
+
+    const result = await pool.query(
+      `SELECT
+        c.topic,
+        COUNT(*) AS chunk_count,
+        SUM(c.token_count) AS total_tokens,
+        MAX(c.last_modified) AS last_modified
+      FROM docmem.chunks c
+      WHERE c.project_id = $1
+      GROUP BY c.topic
+      ORDER BY c.topic`,
+      [projectId]
+    );
+
+    const output = result.rows.map(row => ({
+      topic: row.topic,
+      chunk_count: parseInt(row.chunk_count),
+      total_tokens: parseInt(row.total_tokens),
+      last_modified: row.last_modified,
+    }));
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify(output, null, 2),
+      }],
+    };
+  }
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);

@@ -4,6 +4,11 @@ import { glob } from 'node:fs/promises';
 import { pool } from '../db/pool.js';
 import { chunkMarkdown, type Chunk } from './chunker.js';
 import { embedDocuments, estimateTokens } from './embedder.js';
+import { extractEntities } from './entity-extractor.js';
+import { extractLinks } from './link-extractor.js';
+
+// Entities appearing in more chunks than this are too common to create useful co-occurrence links
+const MAX_COOCCURRENCE_CHUNKS = 20;
 
 interface ProjectConfig {
   project: string;
@@ -16,6 +21,8 @@ interface IndexResult {
   chunksUpdated: number;
   chunksRemoved: number;
   totalChunks: number;
+  entitiesExtracted: number;
+  relationshipsCreated: number;
 }
 
 function loadProjectConfig(projectRoot: string): ProjectConfig {
@@ -156,13 +163,111 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
     console.log(`Removed ${toRemove.length} orphaned chunks`);
   }
 
+  // --- Phase 2: Entity extraction ---
+  console.log('Extracting entities...');
+
+  // Clear existing entities and relationships for this project (full refresh)
+  await pool.query('DELETE FROM docmem.relationships WHERE source_id IN (SELECT id FROM docmem.chunks WHERE project_id = $1)', [projectId]);
+  await pool.query('DELETE FROM docmem.entities WHERE project_id = $1', [projectId]);
+
+  // Get all current chunk IDs and content for this project
+  const allChunksDb = await pool.query(
+    'SELECT id, source_file, section_path, content FROM docmem.chunks WHERE project_id = $1',
+    [projectId]
+  );
+
+  // Build a map of source_file -> chunk IDs for link resolution
+  const fileToChunkIds = new Map<string, string[]>();
+  for (const row of allChunksDb.rows) {
+    const ids = fileToChunkIds.get(row.source_file) ?? [];
+    ids.push(row.id);
+    fileToChunkIds.set(row.source_file, ids);
+  }
+
+  // Extract entities from each chunk and collect entity -> chunk_ids mapping
+  const entityChunkMap = new Map<string, { type: string; chunkIds: Set<string> }>();
+  for (const row of allChunksDb.rows) {
+    const entities = extractEntities(row.content);
+    for (const entity of entities) {
+      const existing = entityChunkMap.get(entity.name);
+      if (existing) {
+        existing.chunkIds.add(row.id);
+      } else {
+        entityChunkMap.set(entity.name, { type: entity.type, chunkIds: new Set([row.id]) });
+      }
+    }
+  }
+
+  // Insert entities
+  let entityCount = 0;
+  for (const [name, { type, chunkIds }] of entityChunkMap) {
+    await pool.query(
+      `INSERT INTO docmem.entities (project_id, name, type, chunk_ids)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (project_id, name) DO UPDATE SET type = $3, chunk_ids = $4`,
+      [projectId, name, type, [...chunkIds]]
+    );
+    entityCount++;
+  }
+  console.log(`Extracted ${entityCount} entities`);
+
+  // --- Phase 2: Link extraction → relationships ---
+  console.log('Extracting links...');
+  let linkCount = 0;
+  for (const row of allChunksDb.rows) {
+    const links = extractLinks(row.content, row.source_file);
+    for (const link of links) {
+      const targetChunkIds = fileToChunkIds.get(link.targetFile);
+      if (!targetChunkIds) continue; // Target file not indexed
+
+      for (const targetId of targetChunkIds) {
+        if (targetId === row.id) continue; // Skip self-links
+        await pool.query(
+          `INSERT INTO docmem.relationships (source_id, target_id, rel_type, confidence)
+           VALUES ($1, $2, 'link', 1.0)`,
+          [row.id, targetId]
+        );
+        linkCount++;
+      }
+    }
+  }
+  console.log(`Created ${linkCount} link relationships`);
+
+  // --- Phase 2: Entity co-occurrence relationships ---
+  console.log('Building co-occurrence relationships...');
+  let cooccurrenceCount = 0;
+  const relationshipPairs = new Set<string>();
+
+  for (const [, { chunkIds }] of entityChunkMap) {
+    if (chunkIds.size < 2 || chunkIds.size > MAX_COOCCURRENCE_CHUNKS) continue;
+
+    const ids = [...chunkIds];
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const pairKey = [ids[i], ids[j]].sort().join('::');
+        if (relationshipPairs.has(pairKey)) continue;
+        relationshipPairs.add(pairKey);
+
+        await pool.query(
+          `INSERT INTO docmem.relationships (source_id, target_id, rel_type, confidence)
+           VALUES ($1, $2, 'shared_entity', 0.5)`,
+          [ids[i], ids[j]]
+        );
+        cooccurrenceCount++;
+      }
+    }
+  }
+  console.log(`Created ${cooccurrenceCount} co-occurrence relationships`);
+
   const result: IndexResult = {
     chunksAdded: added,
     chunksUpdated: updated,
     chunksRemoved: toRemove.length,
     totalChunks: allChunks.length,
+    entitiesExtracted: entityCount,
+    relationshipsCreated: linkCount + cooccurrenceCount,
   };
 
-  console.log(`Done: +${added} ~${updated} -${toRemove.length} = ${allChunks.length} total chunks`);
+  console.log(`Done: +${added} ~${updated} -${toRemove.length} = ${allChunks.length} total chunks, ${entityCount} entities, ${linkCount + cooccurrenceCount} relationships`);
   return result;
 }

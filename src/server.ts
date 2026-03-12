@@ -118,12 +118,29 @@ server.registerTool(
       [chunk_id]
     );
 
+    // Fetch entities mentioned in this chunk
+    const entitiesResult = await pool.query(
+      `SELECT name, type FROM docmem.entities
+       WHERE project_id = (SELECT project_id FROM docmem.chunks WHERE id = $1)
+       AND $1 = ANY(chunk_ids)`,
+      [chunk_id]
+    );
+
+    // Count relationships
+    const relCount = await pool.query(
+      `SELECT COUNT(*) FROM docmem.relationships
+       WHERE source_id = $1 OR target_id = $1`,
+      [chunk_id]
+    );
+
     const output = {
       source_file: row.source_file,
       section_path: row.section_path,
       topic: row.topic,
       token_count: row.token_count,
       content: row.content,
+      entities: entitiesResult.rows.map(e => ({ name: e.name, type: e.type })),
+      related_count: parseInt(relCount.rows[0].count),
     };
 
     return {
@@ -235,6 +252,78 @@ server.registerTool(
         last_modified: row.last_modified,
       })),
     };
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify(output, null, 2),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  'docmem_related',
+  {
+    description: 'Find chunks related to a given chunk via documentation links and shared entities. Use after loading a chunk to discover connected documentation.',
+    inputSchema: {
+      chunk_id: z.string().describe('The chunk ID to find related chunks for'),
+      max_results: z.number().optional().default(10).describe('Max related chunks to return (default 10)'),
+    },
+  },
+  async ({ chunk_id, max_results }) => {
+    // Get relationships in both directions
+    const result = await pool.query(
+      `SELECT
+        CASE WHEN r.source_id = $1 THEN r.target_id ELSE r.source_id END AS related_id,
+        r.rel_type,
+        r.confidence,
+        c.source_file,
+        c.section_path,
+        c.topic,
+        c.token_count
+      FROM docmem.relationships r
+      JOIN docmem.chunks c ON c.id = CASE WHEN r.source_id = $1 THEN r.target_id ELSE r.source_id END
+      WHERE r.source_id = $1 OR r.target_id = $1
+      ORDER BY r.confidence DESC, r.rel_type
+      LIMIT $2`,
+      [chunk_id, max_results ?? 10]
+    );
+
+    if (result.rows.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No related chunks found.' }] };
+    }
+
+    // Deduplicate (a chunk may be related via both link and shared_entity)
+    const seen = new Map<string, { rel_types: string[]; confidence: number; source_file: string; section_path: string; topic: string; token_count: number }>();
+    for (const row of result.rows) {
+      const existing = seen.get(row.related_id);
+      if (existing) {
+        if (!existing.rel_types.includes(row.rel_type)) {
+          existing.rel_types.push(row.rel_type);
+        }
+        existing.confidence = Math.max(existing.confidence, row.confidence);
+      } else {
+        seen.set(row.related_id, {
+          rel_types: [row.rel_type],
+          confidence: row.confidence,
+          source_file: row.source_file,
+          section_path: row.section_path,
+          topic: row.topic,
+          token_count: row.token_count,
+        });
+      }
+    }
+
+    const output = [...seen.entries()].map(([id, data]) => ({
+      chunk_id: id,
+      source_file: data.source_file,
+      section_path: data.section_path,
+      topic: data.topic,
+      token_count: data.token_count,
+      rel_types: data.rel_types,
+      confidence: data.confidence,
+    }));
 
     return {
       content: [{

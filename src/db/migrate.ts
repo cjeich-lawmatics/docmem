@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS docmem.relationships (
   confidence  FLOAT DEFAULT 1.0
 );
 
+CREATE INDEX IF NOT EXISTS idx_relationships_source ON docmem.relationships (source_id);
+CREATE INDEX IF NOT EXISTS idx_relationships_target ON docmem.relationships (target_id);
+
 CREATE TABLE IF NOT EXISTS docmem.access_stats (
   chunk_id       UUID REFERENCES docmem.chunks(id) ON DELETE CASCADE PRIMARY KEY,
   access_count   INT DEFAULT 0,

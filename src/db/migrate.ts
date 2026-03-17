@@ -86,6 +86,12 @@ CREATE INDEX IF NOT EXISTS idx_session_accesses_chunk ON docmem.session_accesses
 -- BM25 full-text search support
 ALTER TABLE docmem.chunks ADD COLUMN IF NOT EXISTS search_vector tsvector;
 CREATE INDEX IF NOT EXISTS idx_chunks_search_vector ON docmem.chunks USING gin (search_vector);
+
+-- Branch-scoped indexing
+ALTER TABLE docmem.chunks ADD COLUMN IF NOT EXISTS branch TEXT DEFAULT 'master';
+ALTER TABLE docmem.chunks ADD COLUMN IF NOT EXISTS merged BOOLEAN DEFAULT true;
+CREATE INDEX IF NOT EXISTS idx_chunks_branch ON docmem.chunks (branch);
+CREATE INDEX IF NOT EXISTS idx_chunks_merged ON docmem.chunks (merged);
 `;
 
 async function migrate() {

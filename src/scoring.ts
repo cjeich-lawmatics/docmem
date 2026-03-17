@@ -5,6 +5,7 @@ export interface ScoringInput {
   lastModified: Date;       // when the chunk's source was last modified
   now: Date;                // current time (injected for testability)
   queryMatchesTopic: boolean; // whether query text contains the topic name
+  usefulness: number;       // 0–1 avg usefulness from feedback (default 0.5)
 }
 
 export interface ScoringResult {
@@ -14,14 +15,16 @@ export interface ScoringResult {
     heat: number;           // weighted heat component
     recency: number;        // weighted recency component
     topic: number;          // weighted topic component
+    usefulness: number;     // weighted usefulness component
   };
 }
 
 const WEIGHTS = {
-  similarity: 0.70,
-  heat: 0.15,
+  similarity: 0.65,
+  heat: 0.10,
   recency: 0.10,
   topic: 0.05,
+  usefulness: 0.10,
 };
 
 const MAX_AGE_DAYS = 365;
@@ -57,9 +60,10 @@ export function computeScore(input: ScoringInput): ScoringResult {
     heat: WEIGHTS.heat * heatNorm,
     recency: WEIGHTS.recency * recencyNorm,
     topic: WEIGHTS.topic * topicBonus,
+    usefulness: WEIGHTS.usefulness * input.usefulness,
   };
 
-  const score = breakdown.similarity + breakdown.heat + breakdown.recency + breakdown.topic;
+  const score = breakdown.similarity + breakdown.heat + breakdown.recency + breakdown.topic + breakdown.usefulness;
 
   return {
     score: Math.round(score * 1000) / 1000,
@@ -68,6 +72,7 @@ export function computeScore(input: ScoringInput): ScoringResult {
       heat: Math.round(breakdown.heat * 1000) / 1000,
       recency: Math.round(breakdown.recency * 1000) / 1000,
       topic: Math.round(breakdown.topic * 1000) / 1000,
+      usefulness: Math.round(breakdown.usefulness * 1000) / 1000,
     },
   };
 }

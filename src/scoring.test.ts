@@ -49,10 +49,11 @@ describe('computeScore', () => {
       lastModified: new Date(),
       now: new Date(),
       queryMatchesTopic: false,
+      usefulness: 0.5,
     };
     const result = computeScore(input);
-    // 0.7 * 0.8 + 0.15 * 0 + 0.10 * 1.0 + 0.05 * 0 = 0.56 + 0 + 0.10 + 0 = 0.66
-    assert.ok(Math.abs(result.score - 0.66) < 0.01, `Expected ~0.66, got ${result.score}`);
+    // 0.65 * 0.8 + 0.10 * 0 + 0.10 * 1.0 + 0.05 * 0 + 0.10 * 0.5 = 0.67
+    assert.ok(Math.abs(result.score - 0.67) < 0.01, `Expected ~0.67, got ${result.score}`);
   });
 
   it('boosts score for hot chunks', () => {
@@ -63,6 +64,7 @@ describe('computeScore', () => {
       lastModified: new Date(),
       now: new Date(),
       queryMatchesTopic: false,
+      usefulness: 0.5,
     };
     const hot: ScoringInput = { ...base, accessCount: 100 };
 
@@ -79,6 +81,7 @@ describe('computeScore', () => {
       lastModified: new Date(),
       now: new Date(),
       queryMatchesTopic: true,
+      usefulness: 0.5,
     };
     const result = computeScore(input);
     assert.ok('breakdown' in result);
@@ -96,11 +99,30 @@ describe('computeScore', () => {
       lastModified: new Date(),
       now: new Date(),
       queryMatchesTopic: false,
+      usefulness: 0.5,
     };
     const match: ScoringInput = { ...noMatch, queryMatchesTopic: true };
 
     const noMatchResult = computeScore(noMatch);
     const matchResult = computeScore(match);
     assert.ok(matchResult.score > noMatchResult.score);
+  });
+
+  it('usefulness signal boosts well-rated chunks', () => {
+    const lowUse: ScoringInput = {
+      similarity: 0.5,
+      accessCount: 0,
+      maxAccess: 0,
+      lastModified: new Date(),
+      now: new Date(),
+      queryMatchesTopic: false,
+      usefulness: 0.2,
+    };
+    const highUse: ScoringInput = { ...lowUse, usefulness: 0.9 };
+
+    const lowResult = computeScore(lowUse);
+    const highResult = computeScore(highUse);
+    assert.ok(highResult.score > lowResult.score, 'High usefulness should score higher');
+    assert.ok('usefulness' in highResult.breakdown);
   });
 });

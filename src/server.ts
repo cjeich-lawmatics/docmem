@@ -63,7 +63,8 @@ server.registerTool(
         c.last_modified,
         p.name AS project_name,
         1 - (c.embedding <=> $1::vector) AS similarity,
-        COALESCE(a.access_count, 0) AS access_count
+        COALESCE(a.access_count, 0) AS access_count,
+        COALESCE(a.avg_usefulness, 0.5) AS avg_usefulness
       FROM docmem.chunks c
       LEFT JOIN docmem.access_stats a ON a.chunk_id = c.id
       JOIN docmem.projects p ON p.id = c.project_id
@@ -105,6 +106,7 @@ server.registerTool(
         lastModified: new Date(row.last_modified),
         now,
         queryMatchesTopic: queryLower.includes(row.topic.split('/').pop()?.toLowerCase() ?? ''),
+        usefulness: parseFloat(row.avg_usefulness),
       });
 
       return { row, score, breakdown };

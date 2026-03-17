@@ -1,6 +1,6 @@
 {
   "name": "docmem",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Token-efficient documentation retrieval MCP server",
   "type": "module",
   "main": "dist/index.js",
@@ -12,8 +12,13 @@
     "dev": "tsc --watch",
     "start": "node dist/server.js",
     "cli": "node dist/cli.js",
-    "db:migrate": "node dist/db/migrate.js"
+    "db:migrate": "node dist/db/migrate.js",
+    "postinstall": "node dist/db/migrate.js 2>/dev/null || true"
   },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts"
+  ],
   "engines": {
     "node": ">=20"
   },

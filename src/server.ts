@@ -23,9 +23,11 @@ server.registerTool(
       query: z.string().describe('Natural language search query'),
       max_results: z.number().optional().default(5).describe('Max results to return (default 5)'),
       topic: z.string().optional().describe('Filter to a specific topic (e.g., "features/automations")'),
+      include_branches: z.boolean().optional().default(false).describe('Include unmerged feature branch docs (default: false, only searches merged/stable docs)'),
+      branch: z.string().optional().describe('Filter to a specific branch (e.g., "feature/billing"). Shows that branch\'s docs overlaid on merged master docs.'),
     },
   },
-  async ({ project, query, max_results, topic }) => {
+  async ({ project, query, max_results, topic, include_branches, branch: branchFilter }) => {
     // 1. Project lookup (supports '*' wildcard)
     let projectId: string | null = null;
 
@@ -80,6 +82,18 @@ server.registerTool(
       vIdx++;
     }
 
+    // Branch filtering
+    if (!include_branches && !branchFilter) {
+      // Default: only merged docs
+      vectorSql += ` AND c.merged = true`;
+    } else if (branchFilter) {
+      // Specific branch: that branch's docs + merged master docs
+      vectorSql += ` AND (c.branch = $${vIdx} OR c.merged = true)`;
+      vectorParams.push(branchFilter);
+      vIdx++;
+    }
+    // include_branches = true: no filter, search everything
+
     vectorSql += ` ORDER BY c.embedding <=> $1::vector LIMIT $${vIdx}`;
     vectorParams.push(candidateLimit);
 
@@ -104,6 +118,10 @@ server.registerTool(
         bm25Params.push(topic);
         bIdx++;
       }
+      if (branchFilter) {
+        bm25Params.push(branchFilter);
+        bIdx++;
+      }
 
       const tsqueryParts = queryVariants.map(variant => {
         bm25Params.push(variant);
@@ -124,6 +142,14 @@ server.registerTool(
       }
       if (topic) {
         bm25Sql += ` AND c.topic = $${filterIdx}`;
+        filterIdx++;
+      }
+
+      // Branch filtering
+      if (!include_branches && !branchFilter) {
+        bm25Sql += ` AND c.merged = true`;
+      } else if (branchFilter) {
+        bm25Sql += ` AND (c.branch = $${filterIdx} OR c.merged = true)`;
         filterIdx++;
       }
 
@@ -152,7 +178,7 @@ server.registerTool(
     // 7. Fetch full data for fused IDs
     const fullSql = `
       SELECT c.id, c.source_file, c.section_path, c.summary, c.topic, c.token_count,
-             c.last_modified, p.name AS project_name,
+             c.last_modified, c.branch, c.merged, p.name AS project_name,
              1 - (c.embedding <=> $1::vector) AS similarity,
              COALESCE(a.access_count, 0) AS access_count,
              COALESCE(a.avg_usefulness, 0.5) AS avg_usefulness
@@ -199,6 +225,8 @@ server.registerTool(
       section_path: s.row.section_path,
       topic: s.row.topic,
       token_count: s.row.token_count,
+      branch: s.row.branch,
+      merged: s.row.merged,
       score: s.score,
       score_breakdown: s.breakdown,
       rrf_score: s.rrfScore,

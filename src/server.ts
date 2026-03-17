@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { pool } from './db/pool.js';
 import { embedQuery } from './indexer/embedder.js';
+import { computeScore } from './scoring.js';
 
 const server = new McpServer({
   name: 'docmem',
@@ -21,7 +22,6 @@ server.registerTool(
     },
   },
   async ({ project, query, max_results, topic }) => {
-    // Get project ID
     const projResult = await pool.query(
       'SELECT id FROM docmem.projects WHERE name = $1',
       [project]
@@ -35,7 +35,19 @@ server.registerTool(
     const queryEmbedding = await embedQuery(query);
     const embeddingStr = `[${queryEmbedding.join(',')}]`;
 
-    // Search with pgvector cosine distance
+    // Get max access count for normalization
+    const maxAccessResult = await pool.query(
+      `SELECT COALESCE(MAX(a.access_count), 0) AS max_access
+       FROM docmem.access_stats a
+       JOIN docmem.chunks c ON c.id = a.chunk_id
+       WHERE c.project_id = $1`,
+      [projectId]
+    );
+    const maxAccess = parseInt(maxAccessResult.rows[0].max_access) || 0;
+
+    // Fetch more candidates than needed so composite re-ranking has room to work
+    const candidateLimit = Math.max((max_results ?? 5) * 3, 15);
+
     let sql = `
       SELECT
         c.id,
@@ -44,8 +56,11 @@ server.registerTool(
         c.summary,
         c.topic,
         c.token_count,
-        1 - (c.embedding <=> $1::vector) AS similarity
+        c.last_modified,
+        1 - (c.embedding <=> $1::vector) AS similarity,
+        COALESCE(a.access_count, 0) AS access_count
       FROM docmem.chunks c
+      LEFT JOIN docmem.access_stats a ON a.chunk_id = c.id
       WHERE c.project_id = $2
     `;
     const params: unknown[] = [embeddingStr, projectId];
@@ -58,7 +73,7 @@ server.registerTool(
     }
 
     sql += ` ORDER BY c.embedding <=> $1::vector LIMIT $${paramIdx}`;
-    params.push(max_results ?? 5);
+    params.push(candidateLimit);
 
     const results = await pool.query(sql, params);
 
@@ -66,15 +81,36 @@ server.registerTool(
       return { content: [{ type: 'text' as const, text: 'No results found.' }] };
     }
 
-    const output = results.rows.map((row, i) => ({
+    const now = new Date();
+    const queryLower = query.toLowerCase();
+
+    // Score and re-rank
+    const scored = results.rows.map(row => {
+      const { score, breakdown } = computeScore({
+        similarity: parseFloat(row.similarity),
+        accessCount: parseInt(row.access_count),
+        maxAccess,
+        lastModified: new Date(row.last_modified),
+        now,
+        queryMatchesTopic: queryLower.includes(row.topic.split('/').pop()?.toLowerCase() ?? ''),
+      });
+
+      return { row, score, breakdown };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+
+    const output = scored.slice(0, max_results ?? 5).map((s, i) => ({
       rank: i + 1,
-      chunk_id: row.id,
-      source_file: row.source_file,
-      section_path: row.section_path,
-      topic: row.topic,
-      token_count: row.token_count,
-      similarity: Math.round(row.similarity * 1000) / 1000,
-      summary: row.summary || `[${row.section_path}] (${row.token_count} tokens)`,
+      chunk_id: s.row.id,
+      source_file: s.row.source_file,
+      section_path: s.row.section_path,
+      topic: s.row.topic,
+      token_count: s.row.token_count,
+      score: s.score,
+      score_breakdown: s.breakdown,
+      similarity: Math.round(parseFloat(s.row.similarity) * 1000) / 1000,
+      summary: s.row.summary || `[${s.row.section_path}] (${s.row.token_count} tokens)`,
     }));
 
     return {

@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { pool } from './db/pool.js';
 import { embedQuery } from './indexer/embedder.js';
 import { computeScore } from './scoring.js';
+import { indexProject } from './indexer/index-project.js';
 
 const server = new McpServer({
   name: 'docmem',
@@ -367,6 +368,39 @@ server.registerTool(
         text: JSON.stringify(output, null, 2),
       }],
     };
+  }
+);
+
+server.registerTool(
+  'docmem_index',
+  {
+    description: 'Reindex a project\'s documentation. Use when you know docs have changed or when search results seem stale. Returns indexing stats.',
+    inputSchema: {
+      project_path: z.string().describe('Absolute path to the project root (must contain .docmem.json)'),
+    },
+  },
+  async ({ project_path }) => {
+    try {
+      const result = await indexProject(project_path);
+      const output = {
+        status: 'ok',
+        ...result,
+      };
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify(output, null, 2),
+        }],
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({ status: 'error', message }, null, 2),
+        }],
+      };
+    }
   }
 );
 

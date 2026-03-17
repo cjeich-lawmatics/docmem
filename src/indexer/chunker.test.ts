@@ -70,4 +70,59 @@ describe('chunkMarkdown', () => {
     const chunks = chunkMarkdown(simpleDoc, 'simple.md');
     assert.strictEqual(chunks.length, 1);
   });
+
+  it('keeps code blocks intact within a section', () => {
+    const doc = `# Title
+
+## Section
+
+Before code.
+
+\`\`\`typescript
+function foo() {
+  return "bar";
+}
+\`\`\`
+
+After code.
+`;
+    const chunks = chunkMarkdown(doc, 'test.md');
+    const section = chunks.find(c => c.sectionPath.includes('Section'));
+    assert.ok(section, 'Should have a Section chunk');
+    assert.ok(section.content.includes('function foo()'), 'Code block should be in the section');
+    assert.ok(section.content.includes('After code'), 'Content after code block should be in same section');
+  });
+
+  it('does not split inside a code fence when breaking large sections', () => {
+    const bigCode = Array(50).fill('  console.log("line");').join('\n');
+    const doc = `# Title
+
+## Big Section
+
+Intro paragraph.
+
+\`\`\`javascript
+${bigCode}
+\`\`\`
+
+Conclusion paragraph.
+`;
+    const chunks = chunkMarkdown(doc, 'test.md');
+    for (const chunk of chunks) {
+      const fenceCount = (chunk.content.match(/^```/gm) || []).length;
+      assert.strictEqual(fenceCount % 2, 0, `Chunk "${chunk.sectionPath}" has unbalanced code fences (${fenceCount})`);
+    }
+  });
+
+  it('splits oversized sections at paragraph boundaries', () => {
+    const paragraphs = Array(20).fill('This is a paragraph with enough text to contribute to a large section. It contains meaningful content that should be kept together as a unit.').join('\n\n');
+    const doc = `# Title
+
+## Huge Section
+
+${paragraphs}
+`;
+    const chunks = chunkMarkdown(doc, 'test.md', { maxChunkTokens: 200 });
+    assert.ok(chunks.length >= 2, `Expected multiple chunks for oversized section, got ${chunks.length}`);
+  });
 });

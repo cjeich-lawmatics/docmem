@@ -16,37 +16,40 @@ server.registerTool(
   {
     description: 'Semantic search across indexed documentation. Returns summaries and metadata only — use docmem_load_chunk to get full content. Always start here to find relevant docs.',
     inputSchema: {
-      project: z.string().describe('Project name (e.g., "boost-api")'),
+      project: z.string().describe('Project name (e.g., "boost-api") or "*" to search all projects'),
       query: z.string().describe('Natural language search query'),
       max_results: z.number().optional().default(5).describe('Max results to return (default 5)'),
       topic: z.string().optional().describe('Filter to a specific topic (e.g., "features/automations")'),
     },
   },
   async ({ project, query, max_results, topic }) => {
-    const projResult = await pool.query(
-      'SELECT id FROM docmem.projects WHERE name = $1',
-      [project]
-    );
-    if (projResult.rows.length === 0) {
-      return { content: [{ type: 'text' as const, text: `Project "${project}" not found. Run "docmem index" first.` }] };
-    }
-    const projectId = projResult.rows[0].id;
+    let projectId: string | null = null;
 
-    // Generate embedding for the query
+    if (project !== '*') {
+      const projResult = await pool.query(
+        'SELECT id FROM docmem.projects WHERE name = $1',
+        [project]
+      );
+      if (projResult.rows.length === 0) {
+        return { content: [{ type: 'text' as const, text: `Project "${project}" not found. Run "docmem index" first.` }] };
+      }
+      projectId = projResult.rows[0].id;
+    }
+
     const queryEmbedding = await embedQuery(query);
     const embeddingStr = `[${queryEmbedding.join(',')}]`;
 
-    // Get max access count for normalization
-    const maxAccessResult = await pool.query(
-      `SELECT COALESCE(MAX(a.access_count), 0) AS max_access
+    let maxAccessSql = `SELECT COALESCE(MAX(a.access_count), 0) AS max_access
        FROM docmem.access_stats a
-       JOIN docmem.chunks c ON c.id = a.chunk_id
-       WHERE c.project_id = $1`,
-      [projectId]
-    );
+       JOIN docmem.chunks c ON c.id = a.chunk_id`;
+    const maxAccessParams: unknown[] = [];
+    if (projectId) {
+      maxAccessSql += ` WHERE c.project_id = $1`;
+      maxAccessParams.push(projectId);
+    }
+    const maxAccessResult = await pool.query(maxAccessSql, maxAccessParams);
     const maxAccess = parseInt(maxAccessResult.rows[0].max_access) || 0;
 
-    // Fetch more candidates than needed so composite re-ranking has room to work
     const candidateLimit = Math.max((max_results ?? 5) * 3, 15);
 
     let sql = `
@@ -58,14 +61,23 @@ server.registerTool(
         c.topic,
         c.token_count,
         c.last_modified,
+        p.name AS project_name,
         1 - (c.embedding <=> $1::vector) AS similarity,
         COALESCE(a.access_count, 0) AS access_count
       FROM docmem.chunks c
       LEFT JOIN docmem.access_stats a ON a.chunk_id = c.id
-      WHERE c.project_id = $2
+      JOIN docmem.projects p ON p.id = c.project_id
     `;
-    const params: unknown[] = [embeddingStr, projectId];
-    let paramIdx = 3;
+    const params: unknown[] = [embeddingStr];
+    let paramIdx = 2;
+
+    if (projectId) {
+      sql += ` WHERE c.project_id = $${paramIdx}`;
+      params.push(projectId);
+      paramIdx++;
+    } else {
+      sql += ` WHERE 1=1`;
+    }
 
     if (topic) {
       sql += ` AND c.topic = $${paramIdx}`;
@@ -85,7 +97,6 @@ server.registerTool(
     const now = new Date();
     const queryLower = query.toLowerCase();
 
-    // Score and re-rank
     const scored = results.rows.map(row => {
       const { score, breakdown } = computeScore({
         similarity: parseFloat(row.similarity),
@@ -104,6 +115,7 @@ server.registerTool(
     const output = scored.slice(0, max_results ?? 5).map((s, i) => ({
       rank: i + 1,
       chunk_id: s.row.id,
+      project: s.row.project_name,
       source_file: s.row.source_file,
       section_path: s.row.section_path,
       topic: s.row.topic,

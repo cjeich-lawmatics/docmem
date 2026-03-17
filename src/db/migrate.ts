@@ -61,6 +61,31 @@ CREATE TABLE IF NOT EXISTS docmem.access_stats (
   last_accessed  TIMESTAMPTZ,
   avg_usefulness FLOAT DEFAULT 0.5
 );
+
+CREATE TABLE IF NOT EXISTS docmem.sessions (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id  UUID REFERENCES docmem.projects(id) ON DELETE CASCADE,
+  started_at  TIMESTAMPTZ DEFAULT NOW(),
+  ended_at    TIMESTAMPTZ,
+  metadata    JSONB DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_project ON docmem.sessions (project_id);
+
+CREATE TABLE IF NOT EXISTS docmem.session_accesses (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id  UUID NOT NULL REFERENCES docmem.sessions(id) ON DELETE CASCADE,
+  chunk_id    UUID NOT NULL REFERENCES docmem.chunks(id) ON DELETE CASCADE,
+  accessed_at TIMESTAMPTZ DEFAULT NOW(),
+  action      TEXT NOT NULL DEFAULT 'load'
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_accesses_session ON docmem.session_accesses (session_id);
+CREATE INDEX IF NOT EXISTS idx_session_accesses_chunk ON docmem.session_accesses (chunk_id);
+
+-- BM25 full-text search support
+ALTER TABLE docmem.chunks ADD COLUMN IF NOT EXISTS search_vector tsvector;
+CREATE INDEX IF NOT EXISTS idx_chunks_search_vector ON docmem.chunks USING gin (search_vector);
 `;
 
 async function migrate() {

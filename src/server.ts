@@ -445,6 +445,49 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  'docmem_feedback',
+  {
+    description: 'Record whether a loaded chunk was useful. Helps improve future search ranking. Call after using a chunk\'s content.',
+    inputSchema: {
+      chunk_id: z.string().describe('The chunk ID to give feedback on'),
+      useful: z.boolean().describe('Whether the chunk content was useful for your task'),
+    },
+  },
+  async ({ chunk_id, useful }) => {
+    const score = useful ? 1.0 : 0.0;
+
+    // Update running average: new_avg = old_avg + (score - old_avg) / count
+    const result = await pool.query(
+      `INSERT INTO docmem.access_stats (chunk_id, access_count, last_accessed, avg_usefulness)
+       VALUES ($1, 0, NOW(), $2)
+       ON CONFLICT (chunk_id) DO UPDATE SET
+         avg_usefulness = docmem.access_stats.avg_usefulness +
+           ($2 - docmem.access_stats.avg_usefulness) / (docmem.access_stats.access_count + 1),
+         last_accessed = NOW()
+       RETURNING avg_usefulness, access_count`,
+      [chunk_id, score]
+    );
+
+    if (result.rows.length === 0) {
+      return { content: [{ type: 'text' as const, text: `Chunk "${chunk_id}" not found.` }] };
+    }
+
+    const row = result.rows[0];
+    return {
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify({
+          status: 'recorded',
+          chunk_id,
+          useful,
+          avg_usefulness: Math.round(parseFloat(row.avg_usefulness) * 100) / 100,
+        }, null, 2),
+      }],
+    };
+  }
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);

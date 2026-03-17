@@ -31,12 +31,31 @@ async function main() {
       console.log('All projects reindexed.');
       break;
     }
+    case 'generate-hooks': {
+      const docmemPath = process.argv[1] || 'docmem';
+      const hookConfig = {
+        hooks: {
+          SessionEnd: [
+            {
+              type: "command" as const,
+              command: `${docmemPath} reindex-all 2>/dev/null &`,
+              timeout: 5000,
+            },
+          ],
+        },
+      };
+      console.log('Add this to your ~/.claude/settings.json:\n');
+      console.log(JSON.stringify(hookConfig, null, 2));
+      console.log('\nThis will automatically reindex all projects when a Claude Code session ends.');
+      break;
+    }
     default:
       console.log('Usage: docmem <command>');
       console.log('');
       console.log('Commands:');
       console.log('  index [path]     Index a project (defaults to current directory)');
       console.log('  reindex-all      Reindex all known projects');
+      console.log('  generate-hooks    Print Claude Code hook config for auto-reindexing');
       break;
   }
   await pool.end();

@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { pool } from './db/pool.js';
 import { embedQuery } from './indexer/embedder.js';
 import { computeScore } from './scoring.js';
+import { fuseResults, expandQuery, type RankedResult } from './hybrid-search.js';
+import { getOrCreateSession, recordSessionAccess } from './sessions.js';
 import { indexProject } from './indexer/index-project.js';
 
 const server = new McpServer({
@@ -23,6 +25,7 @@ server.registerTool(
     },
   },
   async ({ project, query, max_results, topic }) => {
+    // 1. Project lookup (supports '*' wildcard)
     let projectId: string | null = null;
 
     if (project !== '*') {
@@ -36,9 +39,14 @@ server.registerTool(
       projectId = projResult.rows[0].id;
     }
 
+    // 2. Query expansion
+    const queryVariants = expandQuery(query);
+
+    // 3. Embedding for vector search
     const queryEmbedding = await embedQuery(query);
     const embeddingStr = `[${queryEmbedding.join(',')}]`;
 
+    // Max access for heat normalization
     let maxAccessSql = `SELECT COALESCE(MAX(a.access_count), 0) AS max_access
        FROM docmem.access_stats a
        JOIN docmem.chunks c ON c.id = a.chunk_id`;
@@ -52,53 +60,112 @@ server.registerTool(
 
     const candidateLimit = Math.max((max_results ?? 5) * 3, 15);
 
-    let sql = `
-      SELECT
-        c.id,
-        c.source_file,
-        c.section_path,
-        c.summary,
-        c.topic,
-        c.token_count,
-        c.last_modified,
-        p.name AS project_name,
-        1 - (c.embedding <=> $1::vector) AS similarity,
-        COALESCE(a.access_count, 0) AS access_count,
-        COALESCE(a.avg_usefulness, 0.5) AS avg_usefulness
+    // 4. Vector search — ranks only
+    let vectorSql = `
+      SELECT c.id, ROW_NUMBER() OVER (ORDER BY c.embedding <=> $1::vector) AS rank
       FROM docmem.chunks c
-      LEFT JOIN docmem.access_stats a ON a.chunk_id = c.id
-      JOIN docmem.projects p ON p.id = c.project_id
-    `;
-    const params: unknown[] = [embeddingStr];
-    let paramIdx = 2;
+      WHERE 1=1`;
+    const vectorParams: unknown[] = [embeddingStr];
+    let vIdx = 2;
 
     if (projectId) {
-      sql += ` WHERE c.project_id = $${paramIdx}`;
-      params.push(projectId);
-      paramIdx++;
-    } else {
-      sql += ` WHERE 1=1`;
+      vectorSql += ` AND c.project_id = $${vIdx}`;
+      vectorParams.push(projectId);
+      vIdx++;
     }
-
     if (topic) {
-      sql += ` AND c.topic = $${paramIdx}`;
-      params.push(topic);
-      paramIdx++;
+      vectorSql += ` AND c.topic = $${vIdx}`;
+      vectorParams.push(topic);
+      vIdx++;
     }
 
-    sql += ` ORDER BY c.embedding <=> $1::vector LIMIT $${paramIdx}`;
-    params.push(candidateLimit);
+    vectorSql += ` ORDER BY c.embedding <=> $1::vector LIMIT $${vIdx}`;
+    vectorParams.push(candidateLimit);
 
-    const results = await pool.query(sql, params);
+    const vectorResult = await pool.query(vectorSql, vectorParams);
+    const vectorRanked: RankedResult[] = vectorResult.rows.map(r => ({
+      id: r.id,
+      rank: parseInt(r.rank),
+    }));
 
-    if (results.rows.length === 0) {
+    // 5. BM25 search — ranks only (may fail if search_vector not backfilled)
+    let bm25Ranked: RankedResult[] = [];
+    try {
+      // Build tsquery combining all expanded variants with OR
+      const bm25Params: unknown[] = [];
+      let bIdx = 1;
+
+      if (projectId) {
+        bm25Params.push(projectId);
+        bIdx++;
+      }
+      if (topic) {
+        bm25Params.push(topic);
+        bIdx++;
+      }
+
+      const tsqueryParts = queryVariants.map(variant => {
+        bm25Params.push(variant);
+        return `plainto_tsquery('english', $${bIdx++})`;
+      });
+      const tsqueryCombined = tsqueryParts.join(' || ');
+
+      let bm25Sql = `
+        SELECT c.id, ROW_NUMBER() OVER (ORDER BY ts_rank(c.search_vector, query) DESC) AS rank
+        FROM docmem.chunks c, (SELECT ${tsqueryCombined} AS query) q
+        WHERE c.search_vector @@ q.query`;
+
+      // Re-apply filters using the original param positions
+      let filterIdx = 1;
+      if (projectId) {
+        bm25Sql += ` AND c.project_id = $${filterIdx}`;
+        filterIdx++;
+      }
+      if (topic) {
+        bm25Sql += ` AND c.topic = $${filterIdx}`;
+        filterIdx++;
+      }
+
+      bm25Sql += ` ORDER BY ts_rank(c.search_vector, query) DESC LIMIT ${candidateLimit}`;
+
+      const bm25Result = await pool.query(bm25Sql, bm25Params);
+      bm25Ranked = bm25Result.rows.map(r => ({
+        id: r.id,
+        rank: parseInt(r.rank),
+      }));
+    } catch {
+      // BM25 may fail if search_vector column is NULL / not yet backfilled
+    }
+
+    // 6. RRF fusion
+    const fused = fuseResults(vectorRanked, bm25Ranked);
+
+    if (fused.length === 0) {
       return { content: [{ type: 'text' as const, text: 'No results found.' }] };
     }
 
+    // Take top candidates for full data fetch
+    const topIds = fused.slice(0, candidateLimit).map(f => f.id);
+    const rrfScoreMap = new Map(fused.map(f => [f.id, f.rrfScore]));
+
+    // 7. Fetch full data for fused IDs
+    const fullSql = `
+      SELECT c.id, c.source_file, c.section_path, c.summary, c.topic, c.token_count,
+             c.last_modified, p.name AS project_name,
+             1 - (c.embedding <=> $1::vector) AS similarity,
+             COALESCE(a.access_count, 0) AS access_count,
+             COALESCE(a.avg_usefulness, 0.5) AS avg_usefulness
+      FROM docmem.chunks c
+      LEFT JOIN docmem.access_stats a ON a.chunk_id = c.id
+      JOIN docmem.projects p ON p.id = c.project_id
+      WHERE c.id = ANY($2)`;
+    const fullResult = await pool.query(fullSql, [embeddingStr, topIds]);
+
+    // 8. Composite scoring
     const now = new Date();
     const queryLower = query.toLowerCase();
 
-    const scored = results.rows.map(row => {
+    const scored = fullResult.rows.map(row => {
       const { score, breakdown } = computeScore({
         similarity: parseFloat(row.similarity),
         accessCount: parseInt(row.access_count),
@@ -109,12 +176,21 @@ server.registerTool(
         usefulness: parseFloat(row.avg_usefulness),
       });
 
-      return { row, score, breakdown };
+      return { row, score, breakdown, rrfScore: rrfScoreMap.get(row.id) ?? 0 };
     });
 
     scored.sort((a, b) => b.score - a.score);
 
-    const output = scored.slice(0, max_results ?? 5).map((s, i) => ({
+    const topResults = scored.slice(0, max_results ?? 5);
+
+    // 9. Session tracking — record top results
+    const sessionId = await getOrCreateSession(projectId);
+    for (const s of topResults) {
+      await recordSessionAccess(sessionId, s.row.id, 'search');
+    }
+
+    // 10. Output
+    const output = topResults.map((s, i) => ({
       rank: i + 1,
       chunk_id: s.row.id,
       project: s.row.project_name,
@@ -124,6 +200,7 @@ server.registerTool(
       token_count: s.row.token_count,
       score: s.score,
       score_breakdown: s.breakdown,
+      rrf_score: s.rrfScore,
       similarity: Math.round(parseFloat(s.row.similarity) * 1000) / 1000,
       summary: s.row.summary || `[${s.row.section_path}] (${s.row.token_count} tokens)`,
     }));
@@ -147,7 +224,7 @@ server.registerTool(
   },
   async ({ chunk_id }) => {
     const result = await pool.query(
-      `SELECT c.content, c.source_file, c.section_path, c.topic, c.token_count
+      `SELECT c.content, c.source_file, c.section_path, c.topic, c.token_count, c.project_id
        FROM docmem.chunks c
        WHERE c.id = $1`,
       [chunk_id]
@@ -168,6 +245,10 @@ server.registerTool(
          last_accessed = NOW()`,
       [chunk_id]
     );
+
+    // Record session access
+    const sessionId = await getOrCreateSession(row.project_id);
+    await recordSessionAccess(sessionId, chunk_id, 'load');
 
     // Fetch entities mentioned in this chunk
     const entitiesResult = await pool.query(

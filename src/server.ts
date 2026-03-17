@@ -7,6 +7,7 @@ import { computeScore } from './scoring.js';
 import { fuseResults, expandQuery, type RankedResult } from './hybrid-search.js';
 import { getOrCreateSession, recordSessionAccess } from './sessions.js';
 import { indexProject } from './indexer/index-project.js';
+import { getGitFileTimestamp, isStale } from './git-staleness.js';
 
 const server = new McpServer({
   name: 'docmem',
@@ -317,10 +318,7 @@ server.registerTool(
       [projectId]
     );
 
-    // Check staleness by comparing file mtime to indexed last_modified
-    const { statSync } = await import('fs');
-    const { resolve } = await import('path');
-
+    // Check staleness by comparing git commit time to indexed last_modified
     const topicStats = new Map<string, { chunk_count: number; total_tokens: number; last_modified: string; stale_chunks: number }>();
 
     for (const row of result.rows) {
@@ -333,15 +331,8 @@ server.registerTool(
         });
       }
 
-      // Check if source file is newer than indexed version
-      try {
-        const absPath = resolve(rootPath, row.source_file);
-        const stat = statSync(absPath);
-        if (stat.mtime > new Date(row.last_modified)) {
-          topicStats.get(row.topic)!.stale_chunks++;
-        }
-      } catch {
-        // File may have been deleted — counts as stale
+      const gitTime = getGitFileTimestamp(rootPath, row.source_file);
+      if (isStale(gitTime, new Date(row.last_modified))) {
         topicStats.get(row.topic)!.stale_chunks++;
       }
     }

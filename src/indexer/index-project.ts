@@ -131,7 +131,7 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
         // Update existing
         await pool.query(
           `UPDATE docmem.chunks SET
-            content = $1, summary = $2, embedding = $3, token_count = $4,
+            content = $1, search_vector = to_tsvector('english', $1), summary = $2, embedding = $3, token_count = $4,
             topic = $5, checksum = $6, last_modified = $7, updated_at = NOW()
           WHERE id = $8`,
           [chunk.content, '', embeddingStr, tokenCount, chunk.topic, chunk.checksum, chunk.lastModified, ex.id]
@@ -140,8 +140,8 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
       } else {
         // Insert new
         await pool.query(
-          `INSERT INTO docmem.chunks (project_id, source_file, section_path, content, summary, embedding, token_count, topic, checksum, last_modified)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          `INSERT INTO docmem.chunks (project_id, source_file, section_path, content, summary, embedding, token_count, topic, checksum, last_modified, search_vector)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_tsvector('english', $4))`,
           [projectId, chunk.sourceFile, chunk.sectionPath, chunk.content, '', embeddingStr, tokenCount, chunk.topic, chunk.checksum, chunk.lastModified]
         );
         added++;
@@ -258,6 +258,13 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
     }
   }
   console.log(`Created ${cooccurrenceCount} co-occurrence relationships`);
+
+  // Backfill search_vector for any chunks missing it
+  await pool.query(
+    `UPDATE docmem.chunks SET search_vector = to_tsvector('english', content)
+     WHERE project_id = $1 AND search_vector IS NULL`,
+    [projectId]
+  );
 
   const result: IndexResult = {
     chunksAdded: added,

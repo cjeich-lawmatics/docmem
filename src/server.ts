@@ -199,32 +199,61 @@ server.registerTool(
   },
   async ({ project }) => {
     const projResult = await pool.query(
-      'SELECT id FROM docmem.projects WHERE name = $1',
+      'SELECT id, root_path FROM docmem.projects WHERE name = $1',
       [project]
     );
     if (projResult.rows.length === 0) {
       return { content: [{ type: 'text' as const, text: `Project "${project}" not found.` }] };
     }
     const projectId = projResult.rows[0].id;
+    const rootPath = projResult.rows[0].root_path;
 
     const result = await pool.query(
       `SELECT
         c.topic,
-        COUNT(*) AS chunk_count,
-        SUM(c.token_count) AS total_tokens,
-        MAX(c.last_modified) AS last_modified
+        c.source_file,
+        c.last_modified,
+        COUNT(*) OVER (PARTITION BY c.topic) AS chunk_count,
+        SUM(c.token_count) OVER (PARTITION BY c.topic) AS total_tokens,
+        MAX(c.last_modified) OVER (PARTITION BY c.topic) AS topic_last_modified
       FROM docmem.chunks c
       WHERE c.project_id = $1
-      GROUP BY c.topic
-      ORDER BY c.topic`,
+      ORDER BY c.topic, c.source_file`,
       [projectId]
     );
 
-    const output = result.rows.map(row => ({
-      topic: row.topic,
-      chunk_count: parseInt(row.chunk_count),
-      total_tokens: parseInt(row.total_tokens),
-      last_modified: row.last_modified,
+    // Check staleness by comparing file mtime to indexed last_modified
+    const { statSync } = await import('fs');
+    const { resolve } = await import('path');
+
+    const topicStats = new Map<string, { chunk_count: number; total_tokens: number; last_modified: string; stale_chunks: number }>();
+
+    for (const row of result.rows) {
+      if (!topicStats.has(row.topic)) {
+        topicStats.set(row.topic, {
+          chunk_count: parseInt(row.chunk_count),
+          total_tokens: parseInt(row.total_tokens),
+          last_modified: row.topic_last_modified,
+          stale_chunks: 0,
+        });
+      }
+
+      // Check if source file is newer than indexed version
+      try {
+        const absPath = resolve(rootPath, row.source_file);
+        const stat = statSync(absPath);
+        if (stat.mtime > new Date(row.last_modified)) {
+          topicStats.get(row.topic)!.stale_chunks++;
+        }
+      } catch {
+        // File may have been deleted — counts as stale
+        topicStats.get(row.topic)!.stale_chunks++;
+      }
+    }
+
+    const output = [...topicStats.entries()].map(([topic, stats]) => ({
+      topic,
+      ...stats,
     }));
 
     return {

@@ -6,6 +6,7 @@ import { chunkMarkdown, type Chunk } from './chunker.js';
 import { embedDocuments, estimateTokens } from './embedder.js';
 import { extractEntities } from './entity-extractor.js';
 import { extractLinks } from './link-extractor.js';
+import { detectBranch, isMainBranch, promoteMergedBranches, cleanupDeletedBranches } from '../branch-manager.js';
 
 // Entities appearing in more chunks than this are too common to create useful co-occurrence links
 const MAX_COOCCURRENCE_CHUNKS = 20;
@@ -66,6 +67,10 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
   const config = loadProjectConfig(absRoot);
   const projectId = await ensureProject(config.project, absRoot, config);
 
+  const branch = detectBranch(absRoot);
+  const merged = isMainBranch(branch);
+  console.log(`Branch: ${branch} (${merged ? 'main' : 'feature'})`);
+
   console.log(`Indexing project "${config.project}" at ${absRoot}`);
 
   // Discover files
@@ -87,19 +92,19 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
 
   // Get existing checksums to skip unchanged chunks
   const existing = await pool.query(
-    'SELECT id, source_file, section_path, checksum FROM docmem.chunks WHERE project_id = $1',
-    [projectId]
+    'SELECT id, source_file, section_path, checksum FROM docmem.chunks WHERE project_id = $1 AND branch = $2',
+    [projectId, branch]
   );
   const existingMap = new Map<string, { id: string; checksum: string }>();
   for (const row of existing.rows) {
-    existingMap.set(`${row.source_file}::${row.section_path}`, { id: row.id, checksum: row.checksum });
+    existingMap.set(`${branch}::${row.source_file}::${row.section_path}`, { id: row.id, checksum: row.checksum });
   }
 
   // Determine which chunks need embedding
   const toEmbed: typeof allChunks = [];
   const unchanged: string[] = [];
   for (const chunk of allChunks) {
-    const key = `${chunk.sourceFile}::${chunk.sectionPath}`;
+    const key = `${branch}::${chunk.sourceFile}::${chunk.sectionPath}`;
     const ex = existingMap.get(key);
     if (ex && ex.checksum === chunk.checksum) {
       unchanged.push(ex.id);
@@ -122,7 +127,7 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
     for (let i = 0; i < toEmbed.length; i++) {
       const chunk = toEmbed[i];
       const embedding = embeddings[i];
-      const key = `${chunk.sourceFile}::${chunk.sectionPath}`;
+      const key = `${branch}::${chunk.sourceFile}::${chunk.sectionPath}`;
       const ex = existingMap.get(key);
       const tokenCount = estimateTokens(chunk.content);
       const embeddingStr = `[${embedding.join(',')}]`;
@@ -132,17 +137,17 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
         await pool.query(
           `UPDATE docmem.chunks SET
             content = $1, search_vector = to_tsvector('english', $1), summary = $2, embedding = $3, token_count = $4,
-            topic = $5, checksum = $6, last_modified = $7, updated_at = NOW()
+            topic = $5, checksum = $6, last_modified = $7, branch = $9, merged = $10, updated_at = NOW()
           WHERE id = $8`,
-          [chunk.content, '', embeddingStr, tokenCount, chunk.topic, chunk.checksum, chunk.lastModified, ex.id]
+          [chunk.content, '', embeddingStr, tokenCount, chunk.topic, chunk.checksum, chunk.lastModified, ex.id, branch, merged]
         );
         updated++;
       } else {
         // Insert new
         await pool.query(
-          `INSERT INTO docmem.chunks (project_id, source_file, section_path, content, summary, embedding, token_count, topic, checksum, last_modified, search_vector)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_tsvector('english', $4))`,
-          [projectId, chunk.sourceFile, chunk.sectionPath, chunk.content, '', embeddingStr, tokenCount, chunk.topic, chunk.checksum, chunk.lastModified]
+          `INSERT INTO docmem.chunks (project_id, source_file, section_path, content, summary, embedding, token_count, topic, checksum, last_modified, search_vector, branch, merged)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_tsvector('english', $4), $11, $12)`,
+          [projectId, chunk.sourceFile, chunk.sectionPath, chunk.content, '', embeddingStr, tokenCount, chunk.topic, chunk.checksum, chunk.lastModified, branch, merged]
         );
         added++;
       }
@@ -150,7 +155,7 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
   }
 
   // Remove orphaned chunks (files deleted or sections removed)
-  const currentKeys = new Set(allChunks.map(c => `${c.sourceFile}::${c.sectionPath}`));
+  const currentKeys = new Set(allChunks.map(c => `${branch}::${c.sourceFile}::${c.sectionPath}`));
   const toRemove = [...existingMap.entries()]
     .filter(([key]) => !currentKeys.has(key))
     .map(([, val]) => val.id);
@@ -258,6 +263,14 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
     }
   }
   console.log(`Created ${cooccurrenceCount} co-occurrence relationships`);
+
+  // Promote chunks from branches that have been merged to master
+  const promoted = await promoteMergedBranches(projectId, absRoot);
+  if (promoted > 0) console.log(`Promoted ${promoted} chunks from merged branches`);
+
+  // Clean up chunks from deleted branches
+  const cleaned = await cleanupDeletedBranches(projectId, absRoot);
+  if (cleaned > 0) console.log(`Cleaned up ${cleaned} chunks from deleted branches`);
 
   // Backfill search_vector for any chunks missing it
   await pool.query(

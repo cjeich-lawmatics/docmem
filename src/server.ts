@@ -337,6 +337,7 @@ server.registerTool(
         c.topic,
         c.source_file,
         c.last_modified,
+        c.branch,
         COUNT(*) OVER (PARTITION BY c.topic) AS chunk_count,
         SUM(c.token_count) OVER (PARTITION BY c.topic) AS total_tokens,
         MAX(c.last_modified) OVER (PARTITION BY c.topic) AS topic_last_modified
@@ -347,7 +348,7 @@ server.registerTool(
     );
 
     // Check staleness by comparing git commit time to indexed last_modified
-    const topicStats = new Map<string, { chunk_count: number; total_tokens: number; last_modified: string; stale_chunks: number }>();
+    const topicStats = new Map<string, { chunk_count: number; total_tokens: number; last_modified: string; stale_chunks: number; branches: Set<string> }>();
 
     for (const row of result.rows) {
       if (!topicStats.has(row.topic)) {
@@ -356,6 +357,7 @@ server.registerTool(
           total_tokens: parseInt(row.total_tokens),
           last_modified: row.topic_last_modified,
           stale_chunks: 0,
+          branches: new Set<string>(),
         });
       }
 
@@ -363,11 +365,13 @@ server.registerTool(
       if (isStale(gitTime, new Date(row.last_modified))) {
         topicStats.get(row.topic)!.stale_chunks++;
       }
+      topicStats.get(row.topic)!.branches.add(row.branch);
     }
 
     const output = [...topicStats.entries()].map(([topic, stats]) => ({
       topic,
       ...stats,
+      branches: [...stats.branches],
     }));
 
     return {
@@ -405,6 +409,8 @@ server.registerTool(
         c.section_path,
         c.token_count,
         c.last_modified,
+        c.branch,
+        c.merged,
         COALESCE(a.access_count, 0) AS access_count
       FROM docmem.chunks c
       LEFT JOIN docmem.access_stats a ON a.chunk_id = c.id
@@ -430,6 +436,8 @@ server.registerTool(
         token_count: row.token_count,
         access_count: parseInt(row.access_count),
         last_modified: row.last_modified,
+        branch: row.branch,
+        merged: row.merged,
       })),
     };
 

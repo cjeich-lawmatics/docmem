@@ -571,6 +571,52 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  'docmem_suggest',
+  {
+    description: 'Suggest related chunks based on co-access patterns. Shows what other agents typically loaded alongside a given chunk. Use after loading a chunk to discover commonly co-accessed documentation.',
+    inputSchema: {
+      chunk_id: z.string().describe('The chunk ID to find co-accessed chunks for'),
+      max_results: z.number().optional().default(5).describe('Max suggestions to return (default 5)'),
+    },
+  },
+  async ({ chunk_id, max_results }) => {
+    const result = await pool.query(
+      `SELECT
+        sa2.chunk_id AS suggested_id,
+        c.source_file, c.section_path, c.topic, c.token_count,
+        p.name AS project,
+        COUNT(DISTINCT sa2.session_id) AS co_access_count
+      FROM docmem.session_accesses sa1
+      JOIN docmem.session_accesses sa2 ON sa2.session_id = sa1.session_id AND sa2.chunk_id != sa1.chunk_id
+      JOIN docmem.chunks c ON c.id = sa2.chunk_id
+      JOIN docmem.projects p ON p.id = c.project_id
+      WHERE sa1.chunk_id = $1
+      GROUP BY sa2.chunk_id, c.source_file, c.section_path, c.topic, c.token_count, p.name
+      ORDER BY co_access_count DESC
+      LIMIT $2`,
+      [chunk_id, max_results ?? 5]
+    );
+
+    if (result.rows.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No co-access patterns found yet. Suggestions improve as more chunks are accessed in sessions.' }] };
+    }
+
+    const output = result.rows.map((row, i) => ({
+      rank: i + 1,
+      chunk_id: row.suggested_id,
+      project: row.project,
+      source_file: row.source_file,
+      section_path: row.section_path,
+      topic: row.topic,
+      token_count: row.token_count,
+      co_access_count: parseInt(row.co_access_count),
+    }));
+
+    return { content: [{ type: 'text' as const, text: JSON.stringify(output, null, 2) }] };
+  }
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);

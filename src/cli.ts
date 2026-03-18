@@ -86,6 +86,41 @@ async function main() {
       }
       break;
     }
+    case 'setup-team': {
+      console.log(`DocMem Team Setup
+================
+
+1. Start the shared database:
+   docker compose up -d postgres
+
+2. Run migrations:
+   docker compose run --rm migrate
+
+3. Index projects:
+   docker compose run --rm cli index /repos/boost-api
+   docker compose run --rm cli index /repos/boost-client
+   # ... or index all at once:
+   docker compose run --rm cli reindex-all
+
+4. Configure each team member's Claude Code MCP settings:
+   Add to ~/.claude/settings.json:
+   {
+     "mcpServers": {
+       "docmem": {
+         "command": "node",
+         "args": ["/path/to/docmem/dist/server.js"],
+         "env": {
+           "DATABASE_URL": "postgresql://docmem:<password>@<team-db-host>:5433/docmem"
+         }
+       }
+     }
+   }
+
+5. Team members can now search all indexed docs.
+   Feature branch docs are scoped — only merged docs appear by default.
+`);
+      break;
+    }
     default:
       console.log('Usage: docmem <command>');
       console.log('');
@@ -95,6 +130,7 @@ async function main() {
       console.log('  promote <branch>  Promote a branch\'s chunks to merged status');
       console.log('  branches          List all indexed branches with chunk counts');
       console.log('  generate-hooks    Print Claude Code hook config for auto-reindexing');
+      console.log('  setup-team        Print team setup instructions');
       break;
   }
   await pool.end();

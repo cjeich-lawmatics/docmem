@@ -4,10 +4,10 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: docmem
-      POSTGRES_PASSWORD: docmem
+      POSTGRES_PASSWORD: ${DOCMEM_DB_PASSWORD:-docmem}
       POSTGRES_DB: docmem
     ports:
-      - '5433:5432'
+      - '${DOCMEM_DB_PORT:-5433}:5432'
     volumes:
       - docmem-pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -15,6 +15,30 @@ services:
       interval: 2s
       timeout: 5s
       retries: 10
+
+  cli:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://docmem:${DOCMEM_DB_PASSWORD:-docmem}@postgres:5432/docmem
+    volumes:
+      - ${HOME}/Code:/repos:ro
+    entrypoint: ["node", "dist/cli.js"]
+    profiles:
+      - tools
+
+  migrate:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://docmem:${DOCMEM_DB_PASSWORD:-docmem}@postgres:5432/docmem
+    entrypoint: ["node", "dist/db/migrate.js"]
+    profiles:
+      - tools
 
 volumes:
   docmem-pgdata:

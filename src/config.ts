@@ -23,4 +23,5 @@ const env = loadEnv();
 
 export const config = {
   databaseUrl: env.DATABASE_URL ?? 'postgresql://docmem:docmem@localhost:5433/docmem',
+  isTeamMode: !!env.DOCMEM_TEAM_DB,
 };

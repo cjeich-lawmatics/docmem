@@ -49,12 +49,51 @@ async function main() {
       console.log('\nThis will automatically reindex all projects when a Claude Code session ends.');
       break;
     }
+    case 'promote': {
+      const branchName = args[1];
+      if (!branchName) {
+        console.log('Usage: docmem promote <branch-name>');
+        console.log('  Promotes all chunks from <branch-name> to merged status.');
+        break;
+      }
+      const result = await pool.query(
+        `UPDATE docmem.chunks SET merged = true WHERE branch = $1 AND merged = false RETURNING id`,
+        [branchName]
+      );
+      console.log(`Promoted ${result.rowCount} chunks from branch "${branchName}".`);
+      break;
+    }
+    case 'branches': {
+      const branches = await pool.query(
+        `SELECT branch, merged, COUNT(*) AS chunks, array_agg(DISTINCT p.name) AS projects
+         FROM docmem.chunks c
+         JOIN docmem.projects p ON p.id = c.project_id
+         GROUP BY branch, merged
+         ORDER BY branch`
+      );
+      if (branches.rows.length === 0) {
+        console.log('No indexed branches.');
+        break;
+      }
+      console.log('Branch                        Merged  Chunks  Projects');
+      console.log('---                           ---     ---     ---');
+      for (const row of branches.rows) {
+        const branch = row.branch.padEnd(30);
+        const merged = (row.merged ? 'yes' : 'no').padEnd(8);
+        const chunks = String(row.chunks).padEnd(8);
+        const projects = row.projects.join(', ');
+        console.log(`${branch}${merged}${chunks}${projects}`);
+      }
+      break;
+    }
     default:
       console.log('Usage: docmem <command>');
       console.log('');
       console.log('Commands:');
-      console.log('  index [path]     Index a project (defaults to current directory)');
-      console.log('  reindex-all      Reindex all known projects');
+      console.log('  index [path]      Index a project (defaults to current directory)');
+      console.log('  reindex-all       Reindex all known projects');
+      console.log('  promote <branch>  Promote a branch\'s chunks to merged status');
+      console.log('  branches          List all indexed branches with chunk counts');
       console.log('  generate-hooks    Print Claude Code hook config for auto-reindexing');
       break;
   }

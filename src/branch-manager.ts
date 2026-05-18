@@ -3,6 +3,10 @@ import { pool } from './db/pool.js';
 
 const MAIN_BRANCHES = new Set(['master', 'main']);
 
+// Strips ANSI SGR escape sequences (e.g. `\x1b[31m`). git emits these when
+// `color.ui=always` is set in a user's config, even when stdout is not a TTY.
+const ANSI_ESCAPE_PATTERN = /\x1b\[[0-9;]*m/g;
+
 export function isMainBranch(branch: string): boolean {
   return MAIN_BRANCHES.has(branch);
 }
@@ -15,6 +19,7 @@ export function normalizeBranchName(raw: string): string {
 export function parseBranchLines(output: string, prefixToTrim?: string): string[] {
   return output
     .split('\n')
+    .map(line => line.replace(ANSI_ESCAPE_PATTERN, ''))
     .map(line => line.replace(/^\*?\s+/, '').trim())
     .filter(Boolean)
     .filter(line => !line.includes(' -> '))
@@ -63,9 +68,7 @@ export function getMergedBranches(rootPath: string): string[] {
       cwd: rootPath, encoding: 'utf-8', timeout: 5000,
     });
 
-    return output.split('\n')
-      .map(line => line.replace(/^\*?\s+/, '').trim())
-      .filter(name => name && !isMainBranch(name));
+    return parseBranchLines(output).filter(name => !isMainBranch(name));
   } catch {
     return [];
   }

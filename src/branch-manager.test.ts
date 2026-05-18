@@ -58,6 +58,19 @@ describe('parseBranchLines', () => {
       ['main', 'feature/docs']
     );
   });
+
+  it('strips ANSI color codes emitted when color.ui=always', () => {
+    // git renders `*` on the current branch in green and other branches uncolored,
+    // but with `color.ui=always` each line is wrapped in ANSI SGR sequences.
+    const colored =
+      '  [31marnie-hk/sc-47198[m\n' +
+      '* [32mchriseich/sc-46487/custom-form-share-sent-activity[m\n' +
+      '  [31mmaster[m\n';
+    assert.deepStrictEqual(
+      parseBranchLines(colored),
+      ['arnie-hk/sc-47198', 'chriseich/sc-46487/custom-form-share-sent-activity', 'master']
+    );
+  });
 });
 
 describe('collectKnownBranches', () => {

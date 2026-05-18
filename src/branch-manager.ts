@@ -12,6 +12,33 @@ export function normalizeBranchName(raw: string): string {
   return trimmed || 'detached';
 }
 
+export function parseBranchLines(output: string, prefixToTrim?: string): string[] {
+  return output
+    .split('\n')
+    .map(line => line.replace(/^\*?\s+/, '').trim())
+    .filter(Boolean)
+    .filter(line => !line.includes(' -> '))
+    .map(line => {
+      if (!prefixToTrim) return line;
+      return line.startsWith(prefixToTrim) ? line.slice(prefixToTrim.length) : line;
+    })
+    .map(normalizeBranchName)
+    .filter(name => name !== 'detached' && name !== 'unknown');
+}
+
+export function collectKnownBranches(localBranches: string[], remoteBranches: string[]): Set<string> {
+  return new Set([
+    'main',
+    'master',
+    ...localBranches.map(normalizeBranchName),
+    ...remoteBranches.map(normalizeBranchName),
+  ]);
+}
+
+export function findStaleBranches(indexedBranches: string[], knownBranches: Set<string>): string[] {
+  return indexedBranches.filter(branch => !knownBranches.has(branch));
+}
+
 export function detectBranch(rootPath: string): string {
   try {
     const output = execSync('git rev-parse --abbrev-ref HEAD', {
@@ -59,23 +86,26 @@ export async function promoteMergedBranches(projectId: string, rootPath: string)
 
 export async function cleanupDeletedBranches(projectId: string, rootPath: string): Promise<number> {
   try {
-    const output = execSync('git branch -r', {
+    const localOutput = execSync('git branch', {
       cwd: rootPath, encoding: 'utf-8', timeout: 5000,
     });
-    const remoteBranches = new Set(
-      output.split('\n')
-        .map(line => line.trim().replace(/^origin\//, ''))
-        .filter(Boolean)
+    const remoteOutput = execSync('git branch -r', {
+      cwd: rootPath, encoding: 'utf-8', timeout: 5000,
+    });
+    const knownBranches = collectKnownBranches(
+      parseBranchLines(localOutput),
+      parseBranchLines(remoteOutput, 'origin/')
     );
-    remoteBranches.add('master');
-    remoteBranches.add('main');
 
     const indexed = await pool.query(
       `SELECT DISTINCT branch FROM docmem.chunks WHERE project_id = $1 AND merged = false`,
       [projectId]
     );
 
-    const stale = indexed.rows.map(r => r.branch).filter(b => !remoteBranches.has(b));
+    const stale = findStaleBranches(
+      indexed.rows.map(r => r.branch),
+      knownBranches
+    );
     if (stale.length === 0) return 0;
 
     const result = await pool.query(

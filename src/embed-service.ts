@@ -54,15 +54,22 @@ export class EmbedService {
   private ensureWorker(): WorkerLike {
     if (this.worker) return this.worker;
     const w = this.factory();
-    w.on('message', (msg: { id: string; embedding?: number[] }) => {
+    w.on('message', (msg: { id: string; embedding?: number[]; error?: string }) => {
       const p = this.pending.get(msg.id);
       if (!p) return; // late reply after timeout — discard
       clearTimeout(p.timer);
       this.pending.delete(msg.id);
+      if (msg.error) console.error('[embed-worker] embed failed:', msg.error);
       p.resolve(msg.embedding ?? null);
     });
-    w.on('error', () => this.failAll());
-    w.on('exit', () => this.failAll());
+    w.on('error', (err: Error) => {
+      console.error('[embed-worker] worker error:', err);
+      this.failAll();
+    });
+    w.on('exit', (code: number) => {
+      if (code !== 0) console.error(`[embed-worker] worker exited with code ${code}`);
+      this.failAll();
+    });
     this.worker = w;
     return w;
   }

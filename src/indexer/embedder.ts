@@ -8,23 +8,25 @@ export const PREFIXES = {
   document: 'title: none | text: ',
 } as const;
 
-let model: Awaited<ReturnType<typeof AutoModel.from_pretrained>> | null = null;
-let tokenizer: Awaited<ReturnType<typeof AutoTokenizer.from_pretrained>> | null = null;
+let modelPromise: ReturnType<typeof AutoModel.from_pretrained> | null = null;
+let tokenizerPromise: ReturnType<typeof AutoTokenizer.from_pretrained> | null = null;
 
-async function getModel() {
-  if (!model) {
+function getModel() {
+  if (!modelPromise) {
     console.error('Loading EmbeddingGemma model (first run downloads ~340MB)...');
-    model = await AutoModel.from_pretrained(MODEL_ID, { dtype: 'q8' as any });
-    console.error('Model loaded.');
+    modelPromise = AutoModel.from_pretrained(MODEL_ID, { dtype: 'q8' as any })
+      .then(m => { console.error('Model loaded.'); return m; })
+      .catch(err => { modelPromise = null; throw err; });
   }
-  return model;
+  return modelPromise;
 }
 
-async function getTokenizer() {
-  if (!tokenizer) {
-    tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID);
+function getTokenizer() {
+  if (!tokenizerPromise) {
+    tokenizerPromise = AutoTokenizer.from_pretrained(MODEL_ID)
+      .catch(err => { tokenizerPromise = null; throw err; });
   }
-  return tokenizer;
+  return tokenizerPromise;
 }
 
 const BATCH_SIZE = 32;

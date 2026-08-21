@@ -1,9 +1,10 @@
+import './runtime-env.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { pool } from './db/pool.js';
-import { embedQuery } from './indexer/embedder.js';
-import { computeScore } from './scoring.js';
+import { embedQueryAsync, startEmbedWorker } from './embed-service.js';
+import { rankResults } from './search-ranking.js';
 import { fuseResults, expandQuery, type RankedResult } from './hybrid-search.js';
 import { getOrCreateSession, recordSessionAccess } from './sessions.js';
 import { indexProject } from './indexer/index-project.js';
@@ -45,9 +46,10 @@ server.registerTool(
     // 2. Query expansion
     const queryVariants = expandQuery(query);
 
-    // 3. Embedding for vector search
-    const queryEmbedding = await embedQuery(query);
-    const embeddingStr = `[${queryEmbedding.join(',')}]`;
+    // 3. Embedding for vector search (off the event loop; null => degrade to BM25)
+    const queryEmbedding = await embedQueryAsync(query);
+    const degraded = queryEmbedding === null;
+    const embeddingStr = degraded ? null : `[${queryEmbedding!.join(',')}]`;
 
     // Max access for heat normalization
     let maxAccessSql = `SELECT COALESCE(MAX(a.access_count), 0) AS max_access
@@ -63,45 +65,46 @@ server.registerTool(
 
     const candidateLimit = Math.max((max_results ?? 5) * 3, 15);
 
-    // 4. Vector search — ranks only
-    let vectorSql = `
-      SELECT c.id, ROW_NUMBER() OVER (ORDER BY c.embedding <=> $1::vector) AS rank
-      FROM docmem.chunks c
-      WHERE 1=1`;
-    const vectorParams: unknown[] = [embeddingStr];
-    let vIdx = 2;
+    // 4. Vector search — ranks only (skipped when degraded)
+    let vectorRanked: RankedResult[] = [];
+    if (!degraded) {
+      let vectorSql = `
+        SELECT c.id, ROW_NUMBER() OVER (ORDER BY c.embedding <=> $1::vector) AS rank
+        FROM docmem.chunks c
+        WHERE 1=1`;
+      const vectorParams: unknown[] = [embeddingStr];
+      let vIdx = 2;
 
-    if (projectId) {
-      vectorSql += ` AND c.project_id = $${vIdx}`;
-      vectorParams.push(projectId);
-      vIdx++;
+      if (projectId) {
+        vectorSql += ` AND c.project_id = $${vIdx}`;
+        vectorParams.push(projectId);
+        vIdx++;
+      }
+      if (topic) {
+        vectorSql += ` AND c.topic = $${vIdx}`;
+        vectorParams.push(topic);
+        vIdx++;
+      }
+
+      // Branch filtering
+      if (!include_branches && !branchFilter) {
+        vectorSql += ` AND c.merged = true`;
+      } else if (branchFilter) {
+        vectorSql += ` AND (c.branch = $${vIdx} OR c.merged = true)`;
+        vectorParams.push(branchFilter);
+        vIdx++;
+      }
+      // include_branches = true: no filter, search everything
+
+      vectorSql += ` ORDER BY c.embedding <=> $1::vector LIMIT $${vIdx}`;
+      vectorParams.push(candidateLimit);
+
+      const vectorResult = await pool.query(vectorSql, vectorParams);
+      vectorRanked = vectorResult.rows.map(r => ({
+        id: r.id,
+        rank: parseInt(r.rank),
+      }));
     }
-    if (topic) {
-      vectorSql += ` AND c.topic = $${vIdx}`;
-      vectorParams.push(topic);
-      vIdx++;
-    }
-
-    // Branch filtering
-    if (!include_branches && !branchFilter) {
-      // Default: only merged docs
-      vectorSql += ` AND c.merged = true`;
-    } else if (branchFilter) {
-      // Specific branch: that branch's docs + merged master docs
-      vectorSql += ` AND (c.branch = $${vIdx} OR c.merged = true)`;
-      vectorParams.push(branchFilter);
-      vIdx++;
-    }
-    // include_branches = true: no filter, search everything
-
-    vectorSql += ` ORDER BY c.embedding <=> $1::vector LIMIT $${vIdx}`;
-    vectorParams.push(candidateLimit);
-
-    const vectorResult = await pool.query(vectorSql, vectorParams);
-    const vectorRanked: RankedResult[] = vectorResult.rows.map(r => ({
-      id: r.id,
-      rank: parseInt(r.rank),
-    }));
 
     // 5. BM25 search — ranks only (may fail if search_vector not backfilled)
     let bm25Ranked: RankedResult[] = [];
@@ -175,69 +178,54 @@ server.registerTool(
     const topIds = fused.slice(0, candidateLimit).map(f => f.id);
     const rrfScoreMap = new Map(fused.map(f => [f.id, f.rrfScore]));
 
-    // 7. Fetch full data for fused IDs
-    const fullSql = `
-      SELECT c.id, c.source_file, c.section_path, c.summary, c.topic, c.token_count,
-             c.last_modified, c.branch, c.merged, p.name AS project_name,
-             1 - (c.embedding <=> $1::vector) AS similarity,
-             COALESCE(a.access_count, 0) AS access_count,
-             COALESCE(a.avg_usefulness, 0.5) AS avg_usefulness
-      FROM docmem.chunks c
-      LEFT JOIN docmem.access_stats a ON a.chunk_id = c.id
-      JOIN docmem.projects p ON p.id = c.project_id
-      WHERE c.id = ANY($2)`;
-    const fullResult = await pool.query(fullSql, [embeddingStr, topIds]);
+    // 7. Fetch full data for fused IDs (no vector similarity when degraded)
+    const fullResult = degraded
+      ? await pool.query(
+          `SELECT c.id, c.source_file, c.section_path, c.summary, c.topic, c.token_count,
+                  c.last_modified, c.branch, c.merged, p.name AS project_name,
+                  0 AS similarity,
+                  COALESCE(a.access_count, 0) AS access_count,
+                  COALESCE(a.avg_usefulness, 0.5) AS avg_usefulness
+           FROM docmem.chunks c
+           LEFT JOIN docmem.access_stats a ON a.chunk_id = c.id
+           JOIN docmem.projects p ON p.id = c.project_id
+           WHERE c.id = ANY($1)`,
+          [topIds]
+        )
+      : await pool.query(
+          `SELECT c.id, c.source_file, c.section_path, c.summary, c.topic, c.token_count,
+                  c.last_modified, c.branch, c.merged, p.name AS project_name,
+                  1 - (c.embedding <=> $1::vector) AS similarity,
+                  COALESCE(a.access_count, 0) AS access_count,
+                  COALESCE(a.avg_usefulness, 0.5) AS avg_usefulness
+           FROM docmem.chunks c
+           LEFT JOIN docmem.access_stats a ON a.chunk_id = c.id
+           JOIN docmem.projects p ON p.id = c.project_id
+           WHERE c.id = ANY($2)`,
+          [embeddingStr, topIds]
+        );
 
-    // 8. Composite scoring
-    const now = new Date();
-    const queryLower = query.toLowerCase();
-
-    const scored = fullResult.rows.map(row => {
-      const { score, breakdown } = computeScore({
-        similarity: parseFloat(row.similarity),
-        accessCount: parseInt(row.access_count),
-        maxAccess,
-        lastModified: new Date(row.last_modified),
-        now,
-        queryMatchesTopic: queryLower.includes(row.topic.split('/').pop()?.toLowerCase() ?? ''),
-        usefulness: parseFloat(row.avg_usefulness),
-      });
-
-      return { row, score, breakdown, rrfScore: rrfScoreMap.get(row.id) ?? 0 };
+    // 8. Composite scoring + ordering (degraded => BM25 RRF order)
+    const { top, results } = rankResults(fullResult.rows as any, {
+      maxAccess,
+      now: new Date(),
+      query,
+      degraded,
+      rrfScoreMap,
+      maxResults: max_results ?? 5,
     });
-
-    scored.sort((a, b) => b.score - a.score);
-
-    const topResults = scored.slice(0, max_results ?? 5);
 
     // 9. Session tracking — record top results
     const sessionId = await getOrCreateSession(projectId);
-    for (const s of topResults) {
+    for (const s of top) {
       await recordSessionAccess(sessionId, s.row.id, 'search');
     }
 
-    // 10. Output
-    const output = topResults.map((s, i) => ({
-      rank: i + 1,
-      chunk_id: s.row.id,
-      project: s.row.project_name,
-      source_file: s.row.source_file,
-      section_path: s.row.section_path,
-      topic: s.row.topic,
-      token_count: s.row.token_count,
-      branch: s.row.branch,
-      merged: s.row.merged,
-      score: s.score,
-      score_breakdown: s.breakdown,
-      rrf_score: s.rrfScore,
-      similarity: Math.round(parseFloat(s.row.similarity) * 1000) / 1000,
-      summary: s.row.summary || `[${s.row.section_path}] (${s.row.token_count} tokens)`,
-    }));
-
+    // 10. Output (flag degraded so the caller knows vector ranking was skipped)
     return {
       content: [{
         type: 'text' as const,
-        text: JSON.stringify(output, null, 2),
+        text: JSON.stringify(degraded ? { degraded: true, results } : results, null, 2),
       }],
     };
   }
@@ -647,6 +635,7 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  startEmbedWorker();
   console.error('DocMem MCP server running on stdio');
 }
 

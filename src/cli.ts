@@ -2,6 +2,8 @@
 import './runtime-env.js';
 import { indexProject } from './indexer/index-project.js';
 import { pool } from './db/pool.js';
+import { isConnectionRefused } from './db/connection-error.js';
+import { config } from './config.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -138,6 +140,21 @@ async function main() {
 }
 
 main().catch((err) => {
+  if (isConnectionRefused(err)) {
+    console.error(
+      `docmem: cannot reach the pgvector DB at ${dbHostPort()} — is the container up? (docker compose up -d)`,
+    );
+    process.exit(3);
+  }
   console.error(err);
   process.exit(1);
 });
+
+function dbHostPort(): string {
+  try {
+    const u = new URL(config.databaseUrl);
+    return `${u.hostname}:${u.port || '5432'}`;
+  } catch {
+    return 'the configured database';
+  }
+}

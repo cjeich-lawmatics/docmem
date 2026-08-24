@@ -16,6 +16,35 @@ const server = new McpServer({
   version: '0.1.0',
 });
 
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+// Completeness for a specific project (null / '*' searches are audited via docmem_status).
+async function projectCompleteness(
+  projectId: string | null,
+): Promise<{ incomplete: boolean; coverage: number }> {
+  if (!projectId) return { incomplete: false, coverage: 1 };
+  const cov = await pool.query(
+    `SELECT p.expected_chunk_count,
+            p.last_full_index_at,
+            count(c.id) FILTER (WHERE c.merged) AS embedded
+     FROM docmem.projects p
+     LEFT JOIN docmem.chunks c ON c.project_id = p.id
+     WHERE p.id = $1
+     GROUP BY p.id, p.expected_chunk_count, p.last_full_index_at`,
+    [projectId],
+  );
+  if (cov.rows.length === 0) return { incomplete: false, coverage: 1 };
+  const row = cov.rows[0];
+  const r = computeCoverage({
+    expected: row.expected_chunk_count,
+    embedded: Number(row.embedded),
+    lastFullIndexAt: row.last_full_index_at,
+  });
+  return { incomplete: !r.complete, coverage: r.coverage };
+}
+
 server.registerTool(
   'docmem_search',
   {
@@ -172,6 +201,15 @@ server.registerTool(
     const fused = fuseResults(vectorRanked, bm25Ranked);
 
     if (fused.length === 0) {
+      // Empty results are the worst partial-index case (issue #4): a query matches nothing
+      // precisely because the index is barely built. Surface the flag rather than a bare miss.
+      const { incomplete, coverage } = await projectCompleteness(projectId);
+      if (degraded || incomplete) {
+        const flags: Record<string, unknown> = {};
+        if (degraded) flags.degraded = true;
+        if (incomplete) { flags.incomplete = true; flags.coverage = round2(coverage); }
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ ...flags, results: [] }, null, 2) }] };
+      }
       return { content: [{ type: 'text' as const, text: 'No results found.' }] };
     }
 
@@ -223,35 +261,12 @@ server.registerTool(
     }
 
     // 10. Completeness annotation (only for a specific project; '*' is audited via docmem_status)
-    let incomplete = false;
-    let coverage = 1;
-    if (projectId) {
-      const cov = await pool.query(
-        `SELECT p.expected_chunk_count,
-                p.last_full_index_at,
-                count(c.id) FILTER (WHERE c.merged) AS embedded
-         FROM docmem.projects p
-         LEFT JOIN docmem.chunks c ON c.project_id = p.id
-         WHERE p.id = $1
-         GROUP BY p.id, p.expected_chunk_count, p.last_full_index_at`,
-        [projectId]
-      );
-      if (cov.rows.length > 0) {
-        const row = cov.rows[0];
-        const r = computeCoverage({
-          expected: row.expected_chunk_count,
-          embedded: Number(row.embedded),
-          lastFullIndexAt: row.last_full_index_at,
-        });
-        incomplete = !r.complete;
-        coverage = r.coverage;
-      }
-    }
+    const { incomplete, coverage } = await projectCompleteness(projectId);
 
     // 11. Output. Bare array when healthy+complete; wrap only to carry flags (mirrors degraded).
     const flags: Record<string, unknown> = {};
     if (degraded) flags.degraded = true;
-    if (incomplete) { flags.incomplete = true; flags.coverage = Math.round(coverage * 100) / 100; }
+    if (incomplete) { flags.incomplete = true; flags.coverage = round2(coverage); }
     const payload = Object.keys(flags).length > 0 ? { ...flags, results } : results;
     return {
       content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }],

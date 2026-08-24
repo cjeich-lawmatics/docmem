@@ -9,6 +9,7 @@ import { fuseResults, expandQuery, type RankedResult } from './hybrid-search.js'
 import { getOrCreateSession, recordSessionAccess } from './sessions.js';
 import { indexProject } from './indexer/index-project.js';
 import { getGitFileTimestamp, isStale } from './git-staleness.js';
+import { computeCoverage } from './completeness.js';
 
 const server = new McpServer({
   name: 'docmem',
@@ -221,13 +222,83 @@ server.registerTool(
       await recordSessionAccess(sessionId, s.row.id, 'search');
     }
 
-    // 10. Output (flag degraded so the caller knows vector ranking was skipped)
+    // 10. Completeness annotation (only for a specific project; '*' is audited via docmem_status)
+    let incomplete = false;
+    let coverage = 1;
+    if (projectId) {
+      const cov = await pool.query(
+        `SELECT p.expected_chunk_count,
+                p.last_full_index_at,
+                count(c.id) FILTER (WHERE c.merged) AS embedded
+         FROM docmem.projects p
+         LEFT JOIN docmem.chunks c ON c.project_id = p.id
+         WHERE p.id = $1
+         GROUP BY p.id, p.expected_chunk_count, p.last_full_index_at`,
+        [projectId]
+      );
+      if (cov.rows.length > 0) {
+        const row = cov.rows[0];
+        const r = computeCoverage({
+          expected: row.expected_chunk_count,
+          embedded: Number(row.embedded),
+          lastFullIndexAt: row.last_full_index_at,
+        });
+        incomplete = !r.complete;
+        coverage = r.coverage;
+      }
+    }
+
+    // 11. Output. Bare array when healthy+complete; wrap only to carry flags (mirrors degraded).
+    const flags: Record<string, unknown> = {};
+    if (degraded) flags.degraded = true;
+    if (incomplete) { flags.incomplete = true; flags.coverage = Math.round(coverage * 100) / 100; }
+    const payload = Object.keys(flags).length > 0 ? { ...flags, results } : results;
     return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify(degraded ? { degraded: true, results } : results, null, 2),
-      }],
+      content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }],
     };
+  }
+);
+
+server.registerTool(
+  'docmem_status',
+  {
+    description: 'Report index health per project: how many doc chunks are embedded vs expected, coverage %, and when each project was last fully indexed. Call this when docmem_search returns "incomplete" or suspiciously few results, to see whether the index is still being built.',
+    inputSchema: {
+      project: z.string().optional().describe('Optional project name to filter to; omit for all projects'),
+    },
+  },
+  async ({ project }) => {
+    const params: unknown[] = [];
+    let where = '';
+    if (project) { where = 'WHERE p.name = $1'; params.push(project); }
+    const result = await pool.query(
+      `SELECT p.name,
+              p.expected_chunk_count,
+              p.last_full_index_at,
+              count(c.id) FILTER (WHERE c.merged) AS embedded
+       FROM docmem.projects p
+       LEFT JOIN docmem.chunks c ON c.project_id = p.id
+       ${where}
+       GROUP BY p.id, p.name, p.expected_chunk_count, p.last_full_index_at
+       ORDER BY p.name`,
+      params
+    );
+    const rows = result.rows.map(row => {
+      const { coverage, complete } = computeCoverage({
+        expected: row.expected_chunk_count,
+        embedded: Number(row.embedded),
+        lastFullIndexAt: row.last_full_index_at,
+      });
+      return {
+        project: row.name,
+        expected: row.expected_chunk_count,
+        embedded: Number(row.embedded),
+        coverage: Math.round(coverage * 100) / 100,
+        complete,
+        last_full_index_at: row.last_full_index_at,
+      };
+    });
+    return { content: [{ type: 'text' as const, text: JSON.stringify(rows, null, 2) }] };
   }
 );
 

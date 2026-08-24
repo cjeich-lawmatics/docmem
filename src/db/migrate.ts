@@ -92,6 +92,10 @@ ALTER TABLE docmem.chunks ADD COLUMN IF NOT EXISTS branch TEXT DEFAULT 'master';
 ALTER TABLE docmem.chunks ADD COLUMN IF NOT EXISTS merged BOOLEAN DEFAULT true;
 CREATE INDEX IF NOT EXISTS idx_chunks_branch ON docmem.chunks (branch);
 CREATE INDEX IF NOT EXISTS idx_chunks_merged ON docmem.chunks (merged);
+
+-- Index-completeness tracking (issue #4)
+ALTER TABLE docmem.projects ADD COLUMN IF NOT EXISTS expected_chunk_count INT;
+ALTER TABLE docmem.projects ADD COLUMN IF NOT EXISTS last_full_index_at TIMESTAMPTZ;
 `;
 
 async function migrate() {

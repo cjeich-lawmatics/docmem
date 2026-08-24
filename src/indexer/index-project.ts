@@ -289,8 +289,8 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
     [projectId]
   );
 
-  // A fully-completed pass reaches here; stamp completion so a partial (SIGTERM'd) run — which
-  // never gets this far — is distinguishable. Main branch only.
+  // A fully-completed pass reaches here; stamp completion so a partial (SIGTERM'd) run, which
+  // never gets this far, is distinguishable. Main branch only.
   if (merged) {
     await pool.query(
       'UPDATE docmem.projects SET last_full_index_at = NOW() WHERE id = $1',

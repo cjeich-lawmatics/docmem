@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import './runtime-env.js';
 import { indexProject } from './indexer/index-project.js';
 import { pool } from './db/pool.js';
 

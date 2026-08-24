@@ -3,7 +3,7 @@ import { resolve, relative } from 'path';
 import { glob } from 'node:fs/promises';
 import { pool } from '../db/pool.js';
 import { chunkMarkdown, type Chunk } from './chunker.js';
-import { embedDocuments, estimateTokens } from './embedder.js';
+import { embedDocuments, estimateTokens, BATCH_SIZE } from './embedder.js';
 import { extractEntities } from './entity-extractor.js';
 import { extractLinks } from './link-extractor.js';
 import { detectBranch, isMainBranch, promoteMergedBranches, cleanupDeletedBranches } from '../branch-manager.js';
@@ -90,6 +90,15 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
   }
   console.log(`Generated ${allChunks.length} chunks`);
 
+  // Record the expected chunk count for completeness tracking (main branch only — this is the
+  // stable merged doc set that search returns by default).
+  if (merged) {
+    await pool.query(
+      'UPDATE docmem.projects SET expected_chunk_count = $1 WHERE id = $2',
+      [allChunks.length, projectId]
+    );
+  }
+
   // Get existing checksums to skip unchanged chunks
   const existing = await pool.query(
     'SELECT id, source_file, section_path, checksum FROM docmem.chunks WHERE project_id = $1 AND branch = $2',
@@ -119,37 +128,38 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
   let updated = 0;
 
   if (toEmbed.length > 0) {
-    // Generate embeddings
-    console.log('Generating embeddings...');
-    const embeddings = await embedDocuments(toEmbed.map(c => c.content));
+    console.log(`Embedding ${toEmbed.length} chunks in batches of ${BATCH_SIZE}...`);
+    const batchTotal = Math.ceil(toEmbed.length / BATCH_SIZE);
+    for (let start = 0; start < toEmbed.length; start += BATCH_SIZE) {
+      const batch = toEmbed.slice(start, start + BATCH_SIZE);
+      const batchNum = Math.floor(start / BATCH_SIZE) + 1;
+      console.log(`  Batch ${batchNum}/${batchTotal} (${batch.length} chunks)...`);
+      const embeddings = await embedDocuments(batch.map(c => c.content));
+      for (let j = 0; j < batch.length; j++) {
+        const chunk = batch[j];
+        const embedding = embeddings[j];
+        const key = `${branch}::${chunk.sourceFile}::${chunk.sectionPath}`;
+        const ex = existingMap.get(key);
+        const tokenCount = estimateTokens(chunk.content);
+        const embeddingStr = `[${embedding.join(',')}]`;
 
-    // Upsert chunks
-    for (let i = 0; i < toEmbed.length; i++) {
-      const chunk = toEmbed[i];
-      const embedding = embeddings[i];
-      const key = `${branch}::${chunk.sourceFile}::${chunk.sectionPath}`;
-      const ex = existingMap.get(key);
-      const tokenCount = estimateTokens(chunk.content);
-      const embeddingStr = `[${embedding.join(',')}]`;
-
-      if (ex) {
-        // Update existing
-        await pool.query(
-          `UPDATE docmem.chunks SET
-            content = $1, search_vector = to_tsvector('english', $1), summary = $2, embedding = $3, token_count = $4,
-            topic = $5, checksum = $6, last_modified = $7, branch = $9, merged = $10, updated_at = NOW()
-          WHERE id = $8`,
-          [chunk.content, '', embeddingStr, tokenCount, chunk.topic, chunk.checksum, chunk.lastModified, ex.id, branch, merged]
-        );
-        updated++;
-      } else {
-        // Insert new
-        await pool.query(
-          `INSERT INTO docmem.chunks (project_id, source_file, section_path, content, summary, embedding, token_count, topic, checksum, last_modified, search_vector, branch, merged)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_tsvector('english', $4), $11, $12)`,
-          [projectId, chunk.sourceFile, chunk.sectionPath, chunk.content, '', embeddingStr, tokenCount, chunk.topic, chunk.checksum, chunk.lastModified, branch, merged]
-        );
-        added++;
+        if (ex) {
+          await pool.query(
+            `UPDATE docmem.chunks SET
+              content = $1, search_vector = to_tsvector('english', $1), summary = $2, embedding = $3, token_count = $4,
+              topic = $5, checksum = $6, last_modified = $7, branch = $9, merged = $10, updated_at = NOW()
+            WHERE id = $8`,
+            [chunk.content, '', embeddingStr, tokenCount, chunk.topic, chunk.checksum, chunk.lastModified, ex.id, branch, merged]
+          );
+          updated++;
+        } else {
+          await pool.query(
+            `INSERT INTO docmem.chunks (project_id, source_file, section_path, content, summary, embedding, token_count, topic, checksum, last_modified, search_vector, branch, merged)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_tsvector('english', $4), $11, $12)`,
+            [projectId, chunk.sourceFile, chunk.sectionPath, chunk.content, '', embeddingStr, tokenCount, chunk.topic, chunk.checksum, chunk.lastModified, branch, merged]
+          );
+          added++;
+        }
       }
     }
   }
@@ -278,6 +288,15 @@ export async function indexProject(projectRoot: string): Promise<IndexResult> {
      WHERE project_id = $1 AND search_vector IS NULL`,
     [projectId]
   );
+
+  // A fully-completed pass reaches here; stamp completion so a partial (SIGTERM'd) run — which
+  // never gets this far — is distinguishable. Main branch only.
+  if (merged) {
+    await pool.query(
+      'UPDATE docmem.projects SET last_full_index_at = NOW() WHERE id = $1',
+      [projectId]
+    );
+  }
 
   const result: IndexResult = {
     chunksAdded: added,

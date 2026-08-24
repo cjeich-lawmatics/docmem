@@ -29,7 +29,7 @@ function getTokenizer() {
   return tokenizerPromise;
 }
 
-const BATCH_SIZE = 32;
+export const BATCH_SIZE = 32;
 
 /**
  * Generate embeddings for an array of texts.
